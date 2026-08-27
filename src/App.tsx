@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 
@@ -152,69 +152,6 @@ function Hint({ item }: { item: LearningItem }) {
   )
 }
 
-function OpenAIKeyModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
-  const [apiKey, setApiKey] = useState('')
-  const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
-  const [error, setError] = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  useEffect(() => {
-    inputRef.current?.focus()
-    function handleKey(event: KeyboardEvent) {
-      if (event.key === 'Escape' && status !== 'saving') onClose()
-    }
-    window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
-  }, [onClose, status])
-
-  async function saveKey(event: FormEvent) {
-    event.preventDefault()
-    const value = apiKey.trim()
-    if (!value) {
-      setError('OpenAI API 키를 입력해 주세요.')
-      setStatus('error')
-      return
-    }
-    setStatus('saving')
-    setError('')
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/settings/openai-key`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: value }),
-      })
-      const data = await response.json().catch(() => null) as { detail?: string } | null
-      if (!response.ok) throw new Error(data?.detail || 'API 키를 저장하지 못했습니다.')
-      setApiKey('')
-      setStatus('success')
-      window.setTimeout(onSaved, 650)
-    } catch (saveError) {
-      setStatus('error')
-      setError(saveError instanceof TypeError
-        ? '로컬 백엔드에 연결할 수 없습니다.'
-        : saveError instanceof Error ? saveError.message : 'API 키 저장 중 오류가 발생했습니다.')
-    }
-  }
-
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && status !== 'saving' && onClose()}>
-    <section className="api-modal" role="dialog" aria-modal="true" aria-labelledby="api-modal-title" aria-describedby="api-modal-description">
-      <div className="api-modal-icon" aria-hidden="true">✦</div>
-      <button className="modal-close" type="button" onClick={onClose} disabled={status === 'saving'} aria-label="API 설정 닫기">×</button>
-      <span className="modal-eyebrow">OPENAI CONNECTION</span>
-      <h2 id="api-modal-title">OpenAI API 설정</h2>
-      <p id="api-modal-description">자막 정제와 C1 학습 표현 분석에 사용할 API 키를 입력해 주세요.</p>
-      <div className="privacy-note"><span aria-hidden="true">⌁</span><p><b>키는 이 기기에 저장되지 않아요.</b><small>로컬 백엔드의 메모리로만 전송되며 서버를 다시 시작하면 자동으로 삭제됩니다.</small></p></div>
-      <form onSubmit={saveKey}>
-        <label htmlFor="openai-api-key">OpenAI API 키</label>
-        <input ref={inputRef} id="openai-api-key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); if (status === 'error') setStatus('idle') }} placeholder="sk-proj-…" autoComplete="off" spellCheck={false} aria-invalid={status === 'error'} aria-describedby={error ? 'api-key-error' : undefined} disabled={status === 'saving' || status === 'success'} />
-        {error && <p className="modal-error" id="api-key-error" role="alert">{error}</p>}
-        {status === 'success' && <p className="modal-success" role="status">✓ 연결 설정을 저장했어요.</p>}
-        <div className="modal-actions"><button type="button" className="modal-cancel" onClick={onClose} disabled={status === 'saving'}>취소</button><button type="submit" className={`modal-save ${status}`} disabled={status === 'saving' || status === 'success'}>{status === 'saving' ? <><span className="spinner" />저장 중</> : status === 'success' ? '저장 완료' : '저장'}</button></div>
-      </form>
-    </section>
-  </div>
-}
-
 function App() {
   const [tab, setTab] = useState<Tab>(() => new URLSearchParams(window.location.search).get('view') === 'my' ? 'my' : 'dictation')
   const [url, setUrl] = useState('https://youtu.be/ELI8AwyXF1Q')
@@ -239,7 +176,6 @@ function App() {
   const [quizState, setQuizState] = useState<'idle' | 'correct' | 'wrong'>('idle')
   const [quizIndex, setQuizIndex] = useState(0)
   const [toast, setToast] = useState('')
-  const [showApiSettings, setShowApiSettings] = useState(false)
   const [authUser, setAuthUser] = useState<User | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
 
@@ -401,7 +337,6 @@ function App() {
   return (
     <div className="app-shell">
       {toast && <div className="toast">✓ {toast}</div>}
-      {showApiSettings && <OpenAIKeyModal onClose={() => setShowApiSettings(false)} onSaved={() => { setShowApiSettings(false); flash('OpenAI API 연결을 설정했어요') }} />}
       <header>
         <div className="header-inner">
           <a className="brand" href="#top" aria-label="Turtle English 홈">
@@ -422,7 +357,7 @@ function App() {
         </section>
 
         <section className="url-card" aria-label="유튜브 에피소드 불러오기">
-          <div className="url-card-head"><div className="url-copy"><span className="play-dot">▶</span><div><b>학습할 에피소드를 가져오세요</b><small>유튜브 링크 하나면 전체 스크립트와 C1 퀴즈가 준비돼요.</small></div></div><button className="api-settings-button" type="button" onClick={() => setShowApiSettings(true)}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6l-.04.08V21h-4v-.92A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1l-.08-.04H3v-4h.92A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6l.04-.08V3h4v.92A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.1.4.32.75.6 1l.08.04H21v4h-.92a1.7 1.7 0 0 0-.68 1Z"/></svg>API 설정</button></div>
+          <div className="url-card-head"><div className="url-copy"><span className="play-dot">▶</span><div><b>학습할 에피소드를 가져오세요</b><small>유튜브 링크 하나면 전체 스크립트와 C1 퀴즈가 준비돼요.</small></div></div></div>
           <div className="url-form"><input value={url} onChange={(e) => { setUrl(e.target.value); setLoadError('') }} onKeyDown={(e) => e.key === 'Enter' && !loading && startLearning()} placeholder="YouTube 링크를 붙여넣으세요" aria-label="유튜브 링크" aria-invalid={Boolean(loadError)} /><button onClick={startLearning} disabled={loading}>{loading ? <><span className="spinner" />분석 중</> : '학습 시작 →'}</button></div>
           {loadError && <p className="url-error" role="alert">{loadError}</p>}
         </section>
@@ -925,7 +860,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
         <div><span>FULL TRANSCRIPT</span><h2>전체 스크립트</h2></div>
         <label className="follow-toggle"><span>자동으로 따라가기</span><input type="checkbox" checked={autoFollow} onChange={(event) => setAutoFollow(event.target.checked)} /><i aria-hidden="true" /><b>{autoFollow ? 'ON' : 'OFF'}</b></label>
       </div>
-      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 단어 분석 중… {analysisProgress.completed}/{analysisProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>API 키를 연결하면 학습 단어를 분석해요</em>}<b>{currentIndex + 1} / {transcript.length}</b></div>
+      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 단어 분석 중… {analysisProgress.completed}/{analysisProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{currentIndex + 1} / {transcript.length}</b></div>
       <div className="transcript-body reading-body">
         {transcript.map((line, index) => <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`}>
           <span className="timestamp">{line.timestamp_display}</span>

@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from openai import APIConnectionError, APIStatusError, AuthenticationError, OpenAI, RateLimitError
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     CouldNotRetrieveTranscript,
@@ -98,24 +98,6 @@ class HealthResponse(BaseModel):
     status: str
 
 
-class OpenAIKeyRequest(BaseModel):
-    api_key: SecretStr
-
-    @field_validator("api_key")
-    @classmethod
-    def validate_api_key(cls, value: SecretStr) -> SecretStr:
-        raw_key = value.get_secret_value().strip()
-        if not raw_key:
-            raise ValueError("API 키를 입력해 주세요.")
-        if len(raw_key) > 512:
-            raise ValueError("API 키가 허용된 최대 길이를 초과했습니다.")
-        return SecretStr(raw_key)
-
-
-class OpenAIKeyStatusResponse(BaseModel):
-    configured: bool
-
-
 class DefineWordRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -148,7 +130,6 @@ class WordDefinitionsPayload(BaseModel):
 
 
 app = FastAPI(title="Turtle English API", version="1.0.0")
-app.state.openai_api_key = None
 app.state.analysis_jobs = {}
 app.state.analysis_tasks = set()
 app.state.word_definition_cache = None
@@ -609,21 +590,6 @@ async def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@app.post("/api/settings/openai-key", response_model=OpenAIKeyStatusResponse)
-async def set_openai_key(
-    payload: OpenAIKeyRequest, request: Request
-) -> OpenAIKeyStatusResponse:
-    # This secret intentionally lives only for the lifetime of this process.
-    request.app.state.openai_api_key = payload.api_key.get_secret_value()
-    return OpenAIKeyStatusResponse(configured=True)
-
-
-@app.delete("/api/settings/openai-key", response_model=OpenAIKeyStatusResponse)
-async def clear_openai_key(request: Request) -> OpenAIKeyStatusResponse:
-    request.app.state.openai_api_key = None
-    return OpenAIKeyStatusResponse(configured=False)
-
-
 @app.post("/api/vocabulary/define", response_model=WordDefinition)
 async def get_word_definition(
     payload: DefineWordRequest, request: Request
@@ -632,12 +598,11 @@ async def get_word_definition(
     cache_key = payload.word.casefold().strip()
     if cache_key in cache:
         return cache[cache_key]
-    memory_key = getattr(request.app.state, "openai_api_key", None)
-    api_key = memory_key or os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(
             status_code=503,
-            detail="단어 뜻을 불러오려면 OpenAI API 키를 먼저 설정해 주세요.",
+            detail="서버의 AI 기능이 아직 준비되지 않았습니다.",
         )
     try:
         definition = await asyncio.to_thread(
@@ -667,12 +632,11 @@ async def get_word_definition(
 async def translate_transcript_sentence(
     payload: TranslateSentenceRequest, request: Request
 ) -> TranslationResponse:
-    memory_key = getattr(request.app.state, "openai_api_key", None)
-    api_key = memory_key or os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(
             status_code=503,
-            detail="번역을 사용하려면 OpenAI API 키를 먼저 설정해 주세요.",
+            detail="서버의 AI 기능이 아직 준비되지 않았습니다.",
         )
     try:
         return await asyncio.to_thread(translate_sentence, payload.text, api_key)
@@ -695,8 +659,7 @@ async def prefetch_word_definitions(
 
     missing = [item for key, item in requested.items() if key not in cache]
     if missing:
-        memory_key = getattr(request.app.state, "openai_api_key", None)
-        api_key = memory_key or os.getenv("OPENAI_API_KEY", "").strip()
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if api_key:
             try:
                 definitions = await asyncio.to_thread(define_words, missing, api_key)
@@ -779,13 +742,17 @@ async def analyze_episode(
     title, source_name = await asyncio.to_thread(fetch_video_metadata, video_id)
     transcript = build_transcript_blocks(entries)
     chunks = chunk_transcript(entries)
-    memory_key = getattr(request.app.state, "openai_api_key", None)
-    api_key = memory_key or os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="서버의 AI 분석 기능이 아직 준비되지 않았습니다.",
+        )
 
     existing_job = request.app.state.analysis_jobs.get(video_id)
     if existing_job and existing_job["status"] in {"pending", "running", "complete"}:
         job = existing_job
-    elif api_key:
+    else:
         job = {
             "status": "pending",
             "items": [],
@@ -799,16 +766,6 @@ async def analyze_episode(
         )
         request.app.state.analysis_tasks.add(task)
         task.add_done_callback(request.app.state.analysis_tasks.discard)
-    else:
-        job = {
-            "status": "waiting_for_key",
-            "items": [],
-            "completed_chunks": 0,
-            "total_chunks": len(chunks),
-            "error": None,
-        }
-        request.app.state.analysis_jobs[video_id] = job
-
     return AnalyzeEpisodeResponse(
         episode_id=video_id,
         title=title,

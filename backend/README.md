@@ -26,8 +26,6 @@ API 문서는 `http://127.0.0.1:8000/docs`에서 확인할 수 있습니다.
 
 - `GET /api/health`: 서버 상태 확인
 - `POST /api/episodes/analyze`: 자막 추출 및 C1 학습 데이터 생성
-- `POST /api/settings/openai-key`: 현재 서버 프로세스 메모리에 OpenAI 키 설정
-- `DELETE /api/settings/openai-key`: 메모리에 설정한 OpenAI 키 삭제
 - `POST /api/vocabulary/define`: 문맥에 맞는 일반 단어 뜻과 품사 생성
 
 요청 예시:
@@ -40,15 +38,7 @@ API 문서는 `http://127.0.0.1:8000/docs`에서 확인할 수 있습니다.
 
 응답은 실제 영상 제목과 채널명, 전체 문장 블록인 `transcript`, C1 표시용 메타데이터인 `learning_items`를 반환합니다. `learning_items`는 스크립트를 필터링하지 않으며 표시와 퀴즈에만 사용됩니다. 긴 영상은 자막 항목 경계에서 자동으로 분할 분석한 뒤 결과를 병합합니다.
 
-브라우저에서 키를 설정해야 한다면 다음 요청을 사용할 수 있습니다.
-
-```json
-{
-  "api_key": "your_openai_api_key_here"
-}
-```
-
-설정 API는 키 자체를 응답하지 않으며 로그나 파일에 기록하지 않습니다. 키는 실행 중인 서버 프로세스 메모리에만 존재하므로 서버를 재시작하면 사라집니다. 메모리에 설정된 키가 있으면 환경 변수 `OPENAI_API_KEY`보다 우선 사용됩니다.
+OpenAI 키는 서버 환경변수 `OPENAI_API_KEY`에서만 읽습니다. 브라우저 입력이나 프런트엔드 코드로 키를 전달하지 않습니다.
 
 ## 오류 응답
 
