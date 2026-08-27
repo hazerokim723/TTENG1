@@ -4,7 +4,17 @@ import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 
 type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey' | 'my'
-type SavedSentence = { id: number; time: string; text: string }
+type SavedSentence = {
+  id: number | string
+  remoteId?: number
+  time: string
+  text: string
+  savedAt?: string
+  videoId?: string
+  videoTitle?: string
+  channelName?: string
+  timestampSec?: number
+}
 type HighlightColor = 'yellow'
 type Highlight = { id: number; line: number; start: number; end: number; color: HighlightColor; text: string }
 type LearningItem = {
@@ -21,6 +31,7 @@ type LearningItem = {
 }
 type TranscriptBlock = { timestamp_sec: number; end_sec: number; timestamp_display: string; text: string }
 type WordDefinition = { word: string; word_type: string; definition_kr: string }
+type SavedWordDetails = Record<string, WordDefinition>
 type TranslationResponse = { translation_kr: string }
 type OpenAIConnectionResponse = { status: 'connected'; model: string }
 type ApiErrorResponse = { detail?: string }
@@ -121,6 +132,7 @@ const sampleTranscript: TranscriptBlock[] = [
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v1'
+const SAVED_WORD_DETAILS_STORAGE_KEY = 'turtle-saved-word-details-v1'
 const AI_CONNECTION_STORAGE_KEY = 'turtle-openai-connection-v1'
 const ANALYSIS_VERSION = 'b2-c1-phrasal-v1'
 const EPISODE_CACHE_PREFIX = 'turtle-episode-analysis'
@@ -143,6 +155,27 @@ function storeWordDefinitions(cache: Map<string, WordDefinition>) {
   } catch {
     // The backend cache still provides fast lookup when browser storage is unavailable.
   }
+}
+
+function normalizeWordKey(word: string) {
+  return word.trim().toLocaleLowerCase().slice(0, 120)
+}
+
+function savedSentenceKey(videoId: string | undefined, sentence: Pick<SavedSentence, 'time' | 'text' | 'timestampSec'>) {
+  let hash = 2166136261
+  for (const character of sentence.text.trim().toLocaleLowerCase()) {
+    hash ^= character.charCodeAt(0)
+    hash = Math.imul(hash, 16777619)
+  }
+  const timestamp = Math.round((sentence.timestampSec || 0) * 1000) || sentence.time.replace(/\D/g, '') || '0'
+  return `${videoId || 'unknown'}:${timestamp}:${(hash >>> 0).toString(36)}`
+}
+
+function formatSavedDate(value?: string) {
+  if (!value) return '저장 일자 없음'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '저장 일자 없음'
+  return new Intl.DateTimeFormat('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(date)
 }
 
 function loadStoredAIConnection() {
@@ -284,6 +317,7 @@ function App() {
   const [highlights, setHighlights] = useState<Highlight[]>(() => JSON.parse(localStorage.getItem('turtle-highlights') || '[]'))
   const [saved, setSaved] = useState<SavedSentence[]>(() => JSON.parse(localStorage.getItem('turtle-vault') || '[]'))
   const [bag, setBag] = useState<string[]>(() => JSON.parse(localStorage.getItem('turtle-bag') || '["provenance"]'))
+  const [savedWordDetails, setSavedWordDetails] = useState<SavedWordDetails>(() => JSON.parse(localStorage.getItem(SAVED_WORD_DETAILS_STORAGE_KEY) || '{}'))
   const [completedWords, setCompletedWords] = useState<string[]>(() => JSON.parse(localStorage.getItem('turtle-completed-words') || '[]'))
   const [answer, setAnswer] = useState('')
   const [quizState, setQuizState] = useState<'idle' | 'correct' | 'wrong'>('idle')
@@ -308,6 +342,7 @@ function App() {
   useEffect(() => { localStorage.setItem('turtle-highlights', JSON.stringify(highlights)) }, [highlights])
   useEffect(() => { localStorage.setItem('turtle-vault', JSON.stringify(saved)) }, [saved])
   useEffect(() => { localStorage.setItem('turtle-bag', JSON.stringify(bag)) }, [bag])
+  useEffect(() => { localStorage.setItem(SAVED_WORD_DETAILS_STORAGE_KEY, JSON.stringify(savedWordDetails)) }, [savedWordDetails])
   useEffect(() => { localStorage.setItem('turtle-completed-words', JSON.stringify(completedWords)) }, [completedWords])
 
   useEffect(() => {
@@ -334,6 +369,56 @@ function App() {
       listener.subscription.unsubscribe()
     }
   }, [])
+
+  useEffect(() => {
+    if (!supabase || !authUser) return
+    let active = true
+
+    void Promise.all([
+      supabase.from('saved_words').select('word, word_key, word_type, definition_kr').eq('user_id', authUser.id).order('created_at', { ascending: true }),
+      supabase.from('saved_sentences').select('id, sentence_key, sentence_text, video_id, video_title, channel_name, timestamp_sec, timestamp_display, created_at').eq('user_id', authUser.id).order('created_at', { ascending: false }),
+    ]).then(([wordsResult, sentencesResult]) => {
+      if (!active) return
+      if (wordsResult.error || sentencesResult.error) {
+        flash('계정 저장 내용을 불러오지 못했어요. 잠시 후 다시 시도해 주세요')
+        return
+      }
+
+      const remoteWords = wordsResult.data || []
+      setBag((current) => Array.from(new Set([...current.map(normalizeWordKey), ...remoteWords.map((row) => row.word_key)])))
+      setSavedWordDetails((current) => {
+        const next = { ...current }
+        remoteWords.forEach((row) => {
+          next[row.word_key] = {
+            word: row.word,
+            word_type: row.word_type || 'word',
+            definition_kr: row.definition_kr || '저장된 단어',
+          }
+        })
+        return next
+      })
+
+      const remoteSentences: SavedSentence[] = (sentencesResult.data || []).map((row) => ({
+        id: `remote-${row.id}`,
+        remoteId: row.id,
+        time: row.timestamp_display || formatPlayerTime(row.timestamp_sec || 0),
+        text: row.sentence_text,
+        savedAt: row.created_at,
+        videoId: row.video_id || undefined,
+        videoTitle: row.video_title || undefined,
+        channelName: row.channel_name || undefined,
+        timestampSec: row.timestamp_sec || 0,
+      }))
+      setSaved((current) => {
+        const merged = new Map<string, SavedSentence>()
+        current.forEach((sentence) => merged.set(savedSentenceKey(sentence.videoId, sentence), sentence))
+        remoteSentences.forEach((sentence) => merged.set(savedSentenceKey(sentence.videoId, sentence), sentence))
+        return Array.from(merged.values()).sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''))
+      })
+    })
+
+    return () => { active = false }
+  }, [authUser])
 
   useEffect(() => () => analysisControllerRef.current?.abort(), [])
 
@@ -506,15 +591,77 @@ function App() {
     flash(exists ? '형광펜을 해제했어요' : '선택한 부분에 형광펜을 표시했어요')
   }
 
-  function saveSentence(time: string, text: string) {
-    if (!saved.some((s) => s.text === text)) setSaved((now) => [...now, { id: Date.now(), time, text }])
+  function saveSentence(block: TranscriptBlock) {
+    const sentence: SavedSentence = {
+      id: Date.now(),
+      time: block.timestamp_display,
+      text: block.text,
+      savedAt: new Date().toISOString(),
+      videoId: episodeId,
+      videoTitle: episodeTitle,
+      channelName: sourceName,
+      timestampSec: block.timestamp_sec,
+    }
+    const key = savedSentenceKey(episodeId, sentence)
+    if (saved.some((item) => savedSentenceKey(item.videoId, item) === key)) {
+      flash('이미 문장 금고에 저장되어 있어요')
+      return
+    }
+
+    setSaved((current) => [sentence, ...current])
     flash('문장 금고에 안전하게 보관했어요')
+
+    if (supabase && authUser) {
+      void supabase.from('saved_sentences').upsert({
+        user_id: authUser.id,
+        sentence_key: key,
+        sentence_text: sentence.text,
+        video_id: sentence.videoId,
+        video_title: sentence.videoTitle,
+        channel_name: sentence.channelName,
+        timestamp_sec: sentence.timestampSec,
+        timestamp_display: sentence.time,
+      }, { onConflict: 'user_id,sentence_key' }).select('id, created_at').single().then(({ data, error }) => {
+        if (error || !data) {
+          flash('문장은 기기에 저장했지만 계정 동기화에 실패했어요')
+          return
+        }
+        setSaved((current) => current.map((item) => item.id === sentence.id ? { ...item, remoteId: data.id, savedAt: data.created_at } : item))
+      })
+    }
   }
 
-  function saveWord(word: string) {
-    const normalized = word.toLocaleLowerCase()
-    setBag((now) => now.some((item) => item.toLocaleLowerCase() === normalized) ? now : [...now, normalized])
+  function saveWord(word: string, details?: WordDefinition) {
+    const normalized = normalizeWordKey(word)
+    if (!normalized) return
+    const definition = details || savedWordDetails[normalized]
+    setBag((current) => current.some((item) => normalizeWordKey(item) === normalized) ? current : [...current, normalized])
+    if (definition) setSavedWordDetails((current) => ({ ...current, [normalized]: definition }))
     flash(`${word} 단어를 짐가방에 저장했어요`)
+
+    if (supabase && authUser) {
+      void supabase.from('saved_words').upsert({
+        user_id: authUser.id,
+        word,
+        word_key: normalized,
+        word_type: definition?.word_type || null,
+        definition_kr: definition?.definition_kr || null,
+        video_id: episodeId || null,
+        video_title: episodeTitle || null,
+        channel_name: sourceName || null,
+      }, { onConflict: 'user_id,word_key' }).then(({ error }) => {
+        if (error) flash('단어는 기기에 저장했지만 계정 동기화에 실패했어요')
+      })
+    }
+  }
+
+  function removeSavedSentence(id: SavedSentence['id']) {
+    const sentence = saved.find((item) => item.id === id)
+    setSaved((current) => current.filter((item) => item.id !== id))
+    if (!sentence || !supabase || !authUser) return
+    void supabase.from('saved_sentences').delete().eq('user_id', authUser.id).eq('sentence_key', savedSentenceKey(sentence.videoId, sentence)).then(({ error }) => {
+      if (error) flash('기기에서는 삭제했지만 계정 동기화에 실패했어요')
+    })
   }
 
   function completeWord(word: string) {
@@ -531,7 +678,7 @@ function App() {
       setBag((now) => now.filter((w) => w !== item.target_word))
     } else {
       setQuizState('wrong')
-      setBag((now) => now.includes(item.target_word) ? now : [...now, item.target_word])
+      saveWord(item.target_word, { word: item.target_word, word_type: item.word_type, definition_kr: item.definition_kr })
     }
   }
 
@@ -571,10 +718,10 @@ function App() {
         </section>
 
         {loaded && <section className="workspace">
-          {tab === 'dictation' && <Dictation episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} saveSentence={saveSentence} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} />}
+          {tab === 'dictation' && <Dictation episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} />}
           {tab === 'quiz' && <Quiz item={learningItems[quizIndex]} index={quizIndex} total={learningItems.length} answer={answer} setAnswer={setAnswer} state={quizState} submit={submitQuiz} next={() => { setAnswer(''); setQuizState('idle'); setQuizIndex((quizIndex + 1) % learningItems.length) }} />}
-          {tab === 'bag' && <Bag words={bag} items={learningItems} practice={() => navigateTo('quiz')} />}
-          {tab === 'vault' && <Vault sentences={saved} remove={(id) => setSaved(saved.filter((s) => s.id !== id))} />}
+          {tab === 'bag' && <Bag words={bag} items={learningItems} details={savedWordDetails} practice={() => navigateTo('quiz')} />}
+          {tab === 'vault' && <Vault sentences={saved} remove={removeSavedSentence} />}
           {tab === 'journey' && <Journey progress={progress} />}
           {tab === 'my' && <MyPage user={authUser} loading={authLoading} configured={isSupabaseConfigured} onMessage={flash} />}
         </section>}
@@ -670,7 +817,7 @@ function maskLearningTarget(target: string) {
   })
 }
 
-function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (word: string) => void; onComplete: (word: string) => void }) {
+function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (word: string, details?: WordDefinition) => void; onComplete: (word: string) => void }) {
   const phrase = item.target_word.trim()
   const prefix = phrase.slice(0, 2)
   const [revealed, setRevealed] = useState(false)
@@ -690,7 +837,7 @@ function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (wo
     window.clearTimeout(clickTimer.current)
     setRevealed(true)
     setEditing(false)
-    onSave(phrase)
+    onSave(phrase, { word: phrase, word_type: item.word_type, definition_kr: item.definition_kr })
   }
 
   function updateAnswer(nextValue: string) {
@@ -703,7 +850,7 @@ function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (wo
       setShowGood(true)
       window.clearTimeout(goodTimer.current)
       goodTimer.current = window.setTimeout(() => { setShowGood(false); onComplete(phrase) }, 1400)
-      onSave(phrase)
+      onSave(phrase, { word: phrase, word_type: item.word_type, definition_kr: item.definition_kr })
     }
   }
 
@@ -733,7 +880,7 @@ function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (wo
   </span>
 }
 
-function InteractiveScriptText({ text, c1Items, highlights, completedWords, onWordClick, onSaveWord, onCompleteWord }: { text: string; c1Items: LearningItem[]; highlights: Highlight[]; completedWords: string[]; onWordClick: (word: string, event: MouseEvent<HTMLElement>) => void; onSaveWord: (word: string) => void; onCompleteWord: (word: string) => void }) {
+function InteractiveScriptText({ text, c1Items, highlights, completedWords, onWordClick, onSaveWord, onCompleteWord }: { text: string; c1Items: LearningItem[]; highlights: Highlight[]; completedWords: string[]; onWordClick: (word: string, event: MouseEvent<HTMLElement>) => void; onSaveWord: (word: string, details?: WordDefinition) => void; onCompleteWord: (word: string) => void }) {
   const renderSegment = (value: string, offset: number, key: string) => {
     const nodes: ReactNode[] = []
     const targets = [...c1Items].sort((a, b) => b.target_word.length - a.target_word.length)
@@ -792,8 +939,10 @@ type DictationProps = {
   setPlaying: (value: boolean) => void
   highlights: Highlight[]
   toggleHighlight: (item: Omit<Highlight, 'id'>) => void
-  saveSentence: (time: string, text: string) => void
-  saveWord: (word: string) => void
+  savedSentences: SavedSentence[]
+  saveSentence: (block: TranscriptBlock) => void
+  savedWords: string[]
+  saveWord: (word: string, details?: WordDefinition) => void
   completedWords: string[]
   completeWord: (word: string) => void
   episodeProgress: number
@@ -801,14 +950,14 @@ type DictationProps = {
   analysisProgress: { completed: number; total: number }
 }
 
-function Dictation({ episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, saveSentence, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress }: DictationProps) {
+function Dictation({ episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress }: DictationProps) {
   const [palette, setPalette] = useState<null | { line: number; start: number; end: number; text: string; x: number; y: number; placement: 'above' | 'below' }>(null)
   const [autoFollow, setAutoFollow] = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
   const [playerDuration, setPlayerDuration] = useState(0)
   const [playerReady, setPlayerReady] = useState(false)
   const [videoCollapsed, setVideoCollapsed] = useState(false)
-  const [wordPopover, setWordPopover] = useState<null | { x: number; y: number; loading: boolean; data: WordDefinition; error?: string }>(null)
+  const [wordPopover, setWordPopover] = useState<null | { wordKey: string; x: number; y: number; loading: boolean; saved: boolean; data: WordDefinition; error?: string }>(null)
   const [translations, setTranslations] = useState<Record<number, string>>(() => JSON.parse(localStorage.getItem(`turtle-translations-${episodeId}`) || '{}'))
   const [translationLoading, setTranslationLoading] = useState<number | null>(null)
   const lineRefs = useRef<Array<HTMLDivElement | null>>([])
@@ -1016,8 +1165,6 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   function colorSelection() {
     if (!palette) return
     toggleHighlight({ line: palette.line, start: palette.start, end: palette.end, text: palette.text, color: 'yellow' })
-    const block = transcript[palette.line]
-    if (block && palette.text.trim() === block.text.trim()) saveSentence(block.timestamp_display, block.text)
     window.getSelection()?.removeAllRanges()
     setPalette(null)
   }
@@ -1050,14 +1197,23 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   async function openWord(word: string, event: MouseEvent<HTMLElement>, context: string) {
     event.stopPropagation()
     if (window.getSelection()?.toString().trim()) return
-    saveWord(word)
-    const normalized = word.toLocaleLowerCase()
+    const normalized = normalizeWordKey(word)
+    if (wordPopover?.wordKey === normalized) {
+      if (wordPopover.loading) return
+      if (wordPopover.saved) {
+        return
+      }
+      saveWord(wordPopover.data.word, wordPopover.data)
+      setWordPopover((current) => current?.wordKey === normalized ? { ...current, saved: true } : current)
+      return
+    }
     const x = Math.max(130, Math.min(event.clientX, window.innerWidth - 130))
     const y = Math.max(90, event.clientY - 12)
+    const alreadySaved = savedWords.some((item) => normalizeWordKey(item) === normalized)
     const cached = definitionCache.current.get(normalized)
-    if (cached) return setWordPopover({ x, y, loading: false, data: cached })
+    if (cached) return setWordPopover({ wordKey: normalized, x, y, loading: false, saved: alreadySaved, data: cached })
     const fallback: WordDefinition = { word, word_type: 'word', definition_kr: '문맥에 맞는 뜻을 불러오는 중이에요.' }
-    setWordPopover({ x, y, loading: true, data: fallback })
+    setWordPopover({ wordKey: normalized, x, y, loading: true, saved: alreadySaved, data: fallback })
     try {
       const response = await fetch(`${API_BASE_URL}/api/vocabulary/define`, {
         method: 'POST',
@@ -1068,9 +1224,9 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
       if (!response.ok || !data || !('word' in data)) throw new Error(data && 'detail' in data ? data.detail : '뜻을 불러오지 못했습니다.')
       definitionCache.current.set(normalized, data)
       storeWordDefinitions(definitionCache.current)
-      setWordPopover({ x, y, loading: false, data })
+      setWordPopover((current) => current?.wordKey === normalized ? { ...current, loading: false, data } : current)
     } catch (error) {
-      setWordPopover({ x, y, loading: false, data: fallback, error: error instanceof Error ? error.message : '뜻을 불러오지 못했습니다.' })
+      setWordPopover((current) => current?.wordKey === normalized ? { ...current, loading: false, data: fallback, error: error instanceof Error ? error.message : '뜻을 불러오지 못했습니다.' } : current)
     }
   }
 
@@ -1102,10 +1258,14 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
       <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{transcript.length ? (playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요') : '이 영상에는 동기화할 영어 자막이 없어요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 단어 분석 중… {analysisProgress.completed}/{analysisProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{Math.max(0, currentIndex + 1)} / {transcript.length}</b></div>
       <div className="transcript-body reading-body">
         {!transcript.length && <div className="empty-state">YouTube에서 사용할 수 있는 영어 자막을 제공하지 않아 전체 스크립트를 만들 수 없습니다.<br /><small>영상은 위 플레이어에서 그대로 재생할 수 있어요.</small></div>}
-        {transcript.map((line, index) => <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`} onClick={(event) => playFromTranscript(event, line.timestamp_sec)}>
-          <span className="timestamp">{line.timestamp_display}</span>
-          <div className="script-copy"><p onPointerDown={() => setPalette(null)} onPointerUp={(event) => handleSelection(event, index, line.text)}><InteractiveScriptText text={line.text} c1Items={c1ItemsForBlock(line)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event) => openWord(word, event, line.text)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading === index && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
-        </div>)}
+        {transcript.map((line, index) => {
+          const sentenceSaved = savedSentences.some((sentence) => savedSentenceKey(sentence.videoId, sentence) === savedSentenceKey(episodeId, { time: line.timestamp_display, text: line.text, timestampSec: line.timestamp_sec }))
+          return <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`} onClick={(event) => playFromTranscript(event, line.timestamp_sec)}>
+            <span className="timestamp">{line.timestamp_display}</span>
+            <div className="script-copy"><p onPointerDown={() => setPalette(null)} onPointerUp={(event) => handleSelection(event, index, line.text)}><InteractiveScriptText text={line.text} c1Items={c1ItemsForBlock(line)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event) => openWord(word, event, line.text)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading === index && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
+            <button type="button" className={`sentence-save-button ${sentenceSaved ? 'saved' : ''}`} aria-label={sentenceSaved ? '문장 금고에 저장됨' : '문장 금고에 저장'} aria-pressed={sentenceSaved} onClick={(event) => { event.stopPropagation(); saveSentence(line) }}>{sentenceSaved ? '♥' : '♡'}</button>
+          </div>
+        })}
       </div>
       <div className="script-tip"><span>⌁</span><p><b>Tip.</b> 블록의 빈 곳을 누르면 그 시점부터 재생해요. B2·C1 빈칸은 한 번 눌러 입력하고, 두 번 눌러 정답을 확인할 수 있어요.</p></div>
       {palette && createPortal(<div className={`selection-palette ${palette.placement}`} style={{ left: palette.x, top: palette.y }} role="toolbar" aria-label="선택한 텍스트 도구">
@@ -1116,7 +1276,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
       {wordPopover && <aside className="word-popover" style={{ left: wordPopover.x, top: wordPopover.y }} role="status">
         <button onClick={() => setWordPopover(null)} aria-label="단어 뜻 닫기">×</button>
         <b>{wordPopover.data.word}</b><small>{wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>{wordPopover.loading && <i className="popover-loader" />}
-        <span>짐가방에 자동 저장됨</span>
+        <span>{wordPopover.saved ? '짐가방에 저장됨' : wordPopover.loading ? '뜻을 불러오는 중이에요' : '같은 단어를 한 번 더 누르면 저장돼요'}</span>
       </aside>}
     </article>
   </div>
@@ -1129,12 +1289,16 @@ function Quiz({ item, index, total, answer, setAnswer, state, submit, next }: { 
   return <div className="center-panel quiz-panel"><span className="eyebrow">C1 VOCABULARY · {index + 1} / {total}</span><div className="quiz-top"><div className="quiz-progress"><i style={{ width: `${percent}%` }} /></div><b>{percent}%</b></div><h2>빈칸에 들어갈 단어는?</h2><p className="quote">“{displayedSentence}”</p><div className="hint-box"><span>💡</span><p><small>{item.word_type.toUpperCase()}</small>{item.definition_kr}<br /><span>{item.hint_for_tap}</span></p></div><input className={`answer-input ${state}`} value={answer} onChange={(e) => setAnswer(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && submit()} placeholder="영어 단어를 입력하세요" autoFocus />{state === 'correct' && <div className="feedback good"><b>정답이에요! +4 km</b><span>{item.target_word} · {item.definition_kr}</span></div>}{state === 'wrong' && <div className="feedback bad"><b>한 번 더 생각해 볼까요?</b><span>첫 글자는 {item.target_word[0]}, 마지막은 {item.target_word.at(-1)}이에요. 짐가방에 담아둘게요.</span></div>}<button className="primary-action" onClick={state === 'correct' ? next : submit}>{state === 'correct' ? '다음 문제 →' : '정답 확인'}</button></div>
 }
 
-function Bag({ words, items, practice }: { words: string[]; items: LearningItem[]; practice: () => void }) {
-  return <div className="center-panel"><div className="section-title"><div><span className="eyebrow">REVIEW BAGGAGE</span><h2>거북이의 짐가방</h2><p>헷갈렸던 단어는 여기 모아두고 가볍게 다시 꺼내봐요.</p></div><img src="/assets/turtle-b.png" alt="짐가방을 챙기는 거북이" /></div>{words.length ? <div className="vocab-list">{words.map((word) => { const dynamicItem = items.find((entry) => entry.target_word === word); const sampleItem = sampleVocab.find((entry) => entry.word === word) || sampleVocab[2]; return <div className="vocab-row" key={word}><span>{word.slice(0, 1).toUpperCase()}</span><div><h3>{word} <small>{dynamicItem?.word_type || sampleItem.pos}</small></h3><p>{dynamicItem?.definition_kr || sampleItem.meaning}</p></div><button onClick={practice}>다시 풀기 →</button></div> })}</div> : <div className="empty-state">짐가방이 비었어요. 아주 가벼운 여행이네요! 🎉</div>}</div>
+function Bag({ words, items, details, practice }: { words: string[]; items: LearningItem[]; details: SavedWordDetails; practice: () => void }) {
+  return <div className="center-panel"><div className="section-title"><div><span className="eyebrow">REVIEW BAGGAGE</span><h2>거북이의 짐가방</h2><p>헷갈렸던 단어는 여기 모아두고 가볍게 다시 꺼내봐요.</p></div><img src="/assets/turtle-b.png" alt="짐가방을 챙기는 거북이" /></div>{words.length ? <div className="vocab-list">{words.map((word) => { const normalized = normalizeWordKey(word); const savedDetail = details[normalized]; const dynamicItem = items.find((entry) => normalizeWordKey(entry.target_word) === normalized); const sampleItem = sampleVocab.find((entry) => entry.word === normalized) || sampleVocab[2]; return <div className="vocab-row" key={word}><span>{word.slice(0, 1).toUpperCase()}</span><div><h3>{word} <small>{savedDetail?.word_type || dynamicItem?.word_type || sampleItem.pos}</small></h3><p>{savedDetail?.definition_kr || dynamicItem?.definition_kr || sampleItem.meaning}</p></div><button onClick={practice}>다시 풀기 →</button></div> })}</div> : <div className="empty-state">짐가방이 비었어요. 아주 가벼운 여행이네요! 🎉</div>}</div>
 }
 
-function Vault({ sentences, remove }: { sentences: SavedSentence[]; remove: (id: number) => void }) {
-  return <div className="center-panel"><div className="section-title plain"><div><span className="eyebrow">SENTENCE VAULT</span><h2>문장 금고</h2><p>마음에 닿은 문장을 모아 나만의 영어 책을 만들어요.</p></div><b>{sentences.length} 문장</b></div>{sentences.length ? <div className="sentence-list">{sentences.map((s) => <div key={s.id}><span>{s.time}</span><p>“{s.text}”</p><button onClick={() => remove(s.id)}>×</button></div>)}</div> : <div className="empty-state">아직 저장한 문장이 없어요.<br /><small>받아쓰기에서 ♡를 눌러 첫 문장을 담아보세요.</small></div>}</div>
+function Vault({ sentences, remove }: { sentences: SavedSentence[]; remove: (id: SavedSentence['id']) => void }) {
+  return <div className="center-panel"><div className="section-title plain"><div><span className="eyebrow">SENTENCE VAULT</span><h2>문장 금고</h2><p>마음에 닿은 문장을 모아 나만의 영어 책을 만들어요.</p></div><b>{sentences.length} 문장</b></div>{sentences.length ? <div className="sentence-list">{sentences.map((sentence) => <article key={sentence.id}>
+    <div className="sentence-meta"><time>{formatSavedDate(sentence.savedAt)}</time><span>{sentence.videoTitle || 'YouTube 영상'}</span><small>{sentence.channelName || 'YouTube'} · {sentence.time}</small></div>
+    <p>“{sentence.text}”</p>
+    <button onClick={() => remove(sentence.id)} aria-label="저장한 문장 삭제">×</button>
+  </article>)}</div> : <div className="empty-state">아직 저장한 문장이 없어요.<br /><small>받아쓰기에서 ♡를 눌러 첫 문장을 담아보세요.</small></div>}</div>
 }
 
 function Journey({ progress }: { progress: number }) {

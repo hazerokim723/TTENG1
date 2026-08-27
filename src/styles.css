@@ -1121,6 +1121,98 @@ footer {
   font-weight: 700;
 }
 
+.sentence-save-button {
+  width: 34px;
+  height: 34px;
+  align-self: start;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #77857d;
+  background: #fff;
+  border: 1px solid #dfe5e1;
+  border-radius: 50%;
+  font-family: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease;
+}
+
+.sentence-save-button:hover,
+.sentence-save-button:focus-visible {
+  color: #315b47;
+  background: #edf5f0;
+  border-color: #bad0c2;
+  outline: 0;
+  transform: translateY(-1px);
+}
+
+.sentence-save-button.saved {
+  color: #315b47;
+  background: #e5f0e9;
+  border-color: #c8ddcf;
+}
+
+.reading-line {
+  grid-template-columns: 58px minmax(0, 1fr) 38px;
+}
+
+.sentence-list > article {
+  display: grid;
+  grid-template-columns: minmax(150px, 210px) minmax(0, 1fr) 30px;
+  gap: 22px;
+  align-items: start;
+  padding: 22px 5px;
+  border-bottom: 1px solid #ebe9e1;
+}
+
+.sentence-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.sentence-meta time {
+  color: #789080;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.sentence-meta span {
+  overflow: hidden;
+  color: #36463d;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sentence-meta small {
+  overflow: hidden;
+  color: #8a938e;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sentence-list > article > p {
+  margin: 0;
+  color: #29342e;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.sentence-list > article > button {
+  padding: 3px;
+  color: #9da39f;
+  background: transparent;
+  border: 0;
+  font-size: 18px;
+  cursor: pointer;
+}
+
 .popover-loader {
   display: inline-block;
   width: 11px;
@@ -1149,11 +1241,16 @@ footer {
   .reading-view .now-listening { margin-inline: 16px; }
   .now-listening em { display: none; }
   .reading-body { max-height: 70vh; padding-inline: 10px; }
-  .reading-line { grid-template-columns: 42px minmax(0, 1fr); padding: 15px 5px; }
+  .reading-line { grid-template-columns: 42px minmax(0, 1fr) 34px; padding: 15px 5px; }
   .reading-line.current::before { left: -10px; }
   .reading-line p { font-size: 15px; line-height: 1.8; }
   .c1-definition { display: inline-flex; margin-block: 3px; }
   .word-popover { width: min(240px, calc(100vw - 28px)); }
+  .sentence-save-button { width: 30px; height: 30px; font-size: 16px; }
+  .sentence-list > article { grid-template-columns: minmax(0, 1fr) 28px; gap: 10px; }
+  .sentence-meta { grid-column: 1; }
+  .sentence-list > article > p { grid-column: 1 / -1; grid-row: 2; }
+  .sentence-list > article > button { grid-column: 2; grid-row: 1; }
 }
 
 /* MY page: reuses the existing quiet card and profile control language. */
