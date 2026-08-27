@@ -291,8 +291,7 @@ function App() {
   const [authUser, setAuthUser] = useState<User | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
   const [aiConnection, setAiConnection] = useState<'unknown' | 'checking' | 'connected' | 'error'>(() => loadStoredAIConnection() ? 'connected' : 'unknown')
-  const [aiConnectionModel, setAiConnectionModel] = useState(() => loadStoredAIConnection()?.model || '')
-  const [aiConnectionMessage, setAiConnectionMessage] = useState(() => loadStoredAIConnection() ? '서버 키를 자동으로 사용하고 있어요.' : '')
+  const [aiConnectionMessage, setAiConnectionMessage] = useState('')
   const analysisControllerRef = useRef<AbortController | null>(null)
 
   function navigateTo(nextTab: Tab) {
@@ -341,7 +340,7 @@ function App() {
 
   async function checkOpenAIConnection() {
     setAiConnection('checking')
-    setAiConnectionMessage('OpenAI에 실제 요청을 보내 확인하고 있어요…')
+    setAiConnectionMessage('')
     try {
       const response = await fetch(`${API_BASE_URL}/api/openai/validate`, { method: 'POST' })
       const data = await readApiJson<OpenAIConnectionResponse>(response)
@@ -350,13 +349,11 @@ function App() {
 
       localStorage.setItem(AI_CONNECTION_STORAGE_KEY, JSON.stringify(data))
       setAiConnection('connected')
-      setAiConnectionModel(data.model)
-      setAiConnectionMessage(`${data.model} 연결 완료 · 앞으로 서버 키를 자동으로 사용합니다.`)
+      setAiConnectionMessage('')
       flash('OpenAI 연결을 확인했어요')
     } catch (error) {
       localStorage.removeItem(AI_CONNECTION_STORAGE_KEY)
       setAiConnection('error')
-      setAiConnectionModel('')
       setAiConnectionMessage(error instanceof Error ? error.message : 'OpenAI 연결 확인 중 오류가 발생했습니다.')
     }
   }
@@ -555,19 +552,19 @@ function App() {
 
       <main id="top">
         <section className="welcome">
-          <div><span className="eyebrow">YOUR DAILY JOURNEY</span><h1>천천히, 하지만 끝까지.<br /><strong>오늘도 미국으로 한 걸음.</strong></h1><p>진짜 콘텐츠를 흐름 그대로 듣고, 모르는 표현만 깊게 익혀요.</p></div>
+          <div><span className="eyebrow">YOUR ENGLISH JOURNEY</span><h1>천천히, 하지만 꾸준히<br /><strong>오늘도 미국으로 한 걸음.</strong></h1><p>생생한 영어를 들으며 즐겁게 공부해요</p></div>
           <div className="mini-journey"><img src="/assets/turtle-b.png" alt="달리는 거북이" /><div><span><b>뉴욕까지</b><b>{100 - progress} km</b></span><div className="journey-track"><i style={{ width: `${progress}%` }} /></div><small>이번 주 18km 전진 · 상위 12%</small></div></div>
         </section>
 
         <section className="url-card" aria-label="유튜브 에피소드 불러오기">
           <div className="url-card-head">
-            <div className="url-copy"><span className="play-dot">▶</span><div><b>학습할 에피소드를 가져오세요</b><small>유튜브 링크 하나면 전체 스크립트와 C1 퀴즈가 준비돼요.</small></div></div>
+            <div className="url-copy"><span className="play-dot">▶</span><div><b>오늘 함께 듣고 싶은 영상을 공유해주세요</b><small>AI가 영상 스크립트의 단어를 받아쓰기할 수 있게 도와줍니다.</small></div></div>
             <button className={`ai-connection-button ${aiConnection}`} type="button" onClick={checkOpenAIConnection} disabled={aiConnection === 'checking'} aria-label="OpenAI 연결 확인">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h8M17 12v3M20 12v2"/></svg>
               {aiConnection === 'checking' ? '연결 확인 중…' : aiConnection === 'connected' ? 'AI 연결됨' : aiConnection === 'error' ? '다시 확인' : 'AI 연결 확인'}
             </button>
           </div>
-          {aiConnectionMessage && <p className={`ai-connection-message ${aiConnection}`} role="status">{aiConnection === 'connected' && aiConnectionModel ? '✓ ' : ''}{aiConnectionMessage}</p>}
+          {aiConnection === 'error' && aiConnectionMessage && <p className={`ai-connection-message ${aiConnection}`} role="status">{aiConnectionMessage}</p>}
           <div className="url-form"><input value={url} onChange={(e) => { setUrl(e.target.value); setLoadError('') }} onKeyDown={(e) => e.key === 'Enter' && !loading && startLearning()} placeholder="YouTube 링크를 붙여넣으세요" aria-label="유튜브 링크" aria-invalid={Boolean(loadError)} /><button onClick={startLearning} disabled={loading}>{loading ? <><span className="spinner" />분석 중</> : '학습 시작 →'}</button></div>
           {loadError && <p className="url-error" role="alert">{loadError}</p>}
         </section>
