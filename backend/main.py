@@ -98,6 +98,11 @@ class HealthResponse(BaseModel):
     status: str
 
 
+class OpenAIConnectionResponse(BaseModel):
+    status: Literal["connected"]
+    model: str
+
+
 class DefineWordRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -428,6 +433,17 @@ def public_analysis_error(error: Exception) -> str:
     return "학습 단어 분석을 완료하지 못했습니다."
 
 
+def validate_openai_connection(api_key: str) -> None:
+    """Make a minimal model request so auth, model access, and quota are verified."""
+    client = OpenAI(api_key=api_key)
+    client.responses.create(
+        model=OPENAI_MODEL,
+        input="Reply exactly with OK.",
+        max_output_tokens=16,
+        store=False,
+    )
+
+
 async def run_analysis_job(
     video_id: str,
     title: str,
@@ -588,6 +604,48 @@ def normalize_items(items: Iterable[LearningItem]) -> list[LearningItem]:
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+@app.post("/api/openai/validate", response_model=OpenAIConnectionResponse)
+async def validate_openai() -> OpenAIConnectionResponse:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="서버에 OpenAI API 키가 설정되지 않았습니다.",
+        )
+
+    try:
+        await asyncio.to_thread(validate_openai_connection, api_key)
+    except AuthenticationError as error:
+        raise HTTPException(
+            status_code=401,
+            detail="OpenAI API 키가 유효하지 않습니다.",
+        ) from error
+    except RateLimitError as error:
+        raise HTTPException(
+            status_code=429,
+            detail="OpenAI 결제 크레딧 또는 사용 한도를 확인해 주세요.",
+        ) from error
+    except APIConnectionError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI API에 연결할 수 없습니다.",
+        ) from error
+    except APIStatusError as error:
+        detail = (
+            f"OpenAI 모델({OPENAI_MODEL}) 사용 권한 또는 설정을 확인해 주세요."
+            if error.status_code in {400, 403, 404}
+            else f"OpenAI 연결 확인에 실패했습니다. (상태 {error.status_code})"
+        )
+        raise HTTPException(status_code=error.status_code, detail=detail) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI 연결 확인 중 알 수 없는 오류가 발생했습니다.",
+        ) from error
+
+    return OpenAIConnectionResponse(status="connected", model=OPENAI_MODEL)
 
 
 @app.post("/api/vocabulary/define", response_model=WordDefinition)

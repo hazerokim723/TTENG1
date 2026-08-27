@@ -21,6 +21,7 @@ type LearningItem = {
 type TranscriptBlock = { timestamp_sec: number; end_sec: number; timestamp_display: string; text: string }
 type WordDefinition = { word: string; word_type: string; definition_kr: string }
 type TranslationResponse = { translation_kr: string }
+type OpenAIConnectionResponse = { status: 'connected'; model: string }
 type AnalyzeResponse = {
   episode_id: string
   title: string
@@ -109,6 +110,7 @@ const sampleTranscript: TranscriptBlock[] = [
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v1'
+const AI_CONNECTION_STORAGE_KEY = 'turtle-openai-connection-v1'
 const PREFETCH_STOP_WORDS = new Set([
   'about', 'after', 'again', 'also', 'another', 'because', 'before', 'being', 'between', 'could', 'does', 'from', 'have', 'into', 'just', 'more', 'most', 'other', 'over', 'same', 'some', 'such', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'with', 'would', 'your',
 ])
@@ -127,6 +129,15 @@ function storeWordDefinitions(cache: Map<string, WordDefinition>) {
     localStorage.setItem(WORD_CACHE_STORAGE_KEY, JSON.stringify(Object.fromEntries(cache)))
   } catch {
     // The backend cache still provides fast lookup when browser storage is unavailable.
+  }
+}
+
+function loadStoredAIConnection() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(AI_CONNECTION_STORAGE_KEY) || 'null') as OpenAIConnectionResponse | null
+    return stored?.status === 'connected' && typeof stored.model === 'string' ? stored : null
+  } catch {
+    return null
   }
 }
 
@@ -178,6 +189,9 @@ function App() {
   const [toast, setToast] = useState('')
   const [authUser, setAuthUser] = useState<User | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
+  const [aiConnection, setAiConnection] = useState<'unknown' | 'checking' | 'connected' | 'error'>(() => loadStoredAIConnection() ? 'connected' : 'unknown')
+  const [aiConnectionModel, setAiConnectionModel] = useState(() => loadStoredAIConnection()?.model || '')
+  const [aiConnectionMessage, setAiConnectionMessage] = useState(() => loadStoredAIConnection() ? '서버 키를 자동으로 사용하고 있어요.' : '')
 
   function navigateTo(nextTab: Tab) {
     setTab(nextTab)
@@ -244,6 +258,32 @@ function App() {
   }, [analysisStatus, episodeId])
 
   const episodeProgress = useMemo(() => Math.min(100, Math.round((progress / 100) * 100)), [progress])
+
+  async function checkOpenAIConnection() {
+    setAiConnection('checking')
+    setAiConnectionMessage('OpenAI에 실제 요청을 보내 확인하고 있어요…')
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/openai/validate`, { method: 'POST' })
+      const isJson = response.headers.get('content-type')?.includes('application/json')
+      const data = isJson
+        ? await response.json().catch(() => null) as OpenAIConnectionResponse | { detail?: string } | null
+        : null
+      if (!isJson) throw new Error('배포 서버가 API 응답 대신 로그인 페이지를 반환했습니다. Vercel 배포 보호 설정을 확인해 주세요.')
+      if (!response.ok) throw new Error((data && 'detail' in data && data.detail) || 'OpenAI 연결 확인에 실패했습니다.')
+      if (!data || !('status' in data) || data.status !== 'connected') throw new Error('OpenAI 연결 결과를 확인하지 못했습니다.')
+
+      localStorage.setItem(AI_CONNECTION_STORAGE_KEY, JSON.stringify(data))
+      setAiConnection('connected')
+      setAiConnectionModel(data.model)
+      setAiConnectionMessage(`${data.model} 연결 완료 · 앞으로 서버 키를 자동으로 사용합니다.`)
+      flash('OpenAI 연결을 확인했어요')
+    } catch (error) {
+      localStorage.removeItem(AI_CONNECTION_STORAGE_KEY)
+      setAiConnection('error')
+      setAiConnectionModel('')
+      setAiConnectionMessage(error instanceof Error ? error.message : 'OpenAI 연결 확인 중 오류가 발생했습니다.')
+    }
+  }
 
   async function startLearning() {
     const value = url.trim()
@@ -357,7 +397,14 @@ function App() {
         </section>
 
         <section className="url-card" aria-label="유튜브 에피소드 불러오기">
-          <div className="url-card-head"><div className="url-copy"><span className="play-dot">▶</span><div><b>학습할 에피소드를 가져오세요</b><small>유튜브 링크 하나면 전체 스크립트와 C1 퀴즈가 준비돼요.</small></div></div></div>
+          <div className="url-card-head">
+            <div className="url-copy"><span className="play-dot">▶</span><div><b>학습할 에피소드를 가져오세요</b><small>유튜브 링크 하나면 전체 스크립트와 C1 퀴즈가 준비돼요.</small></div></div>
+            <button className={`ai-connection-button ${aiConnection}`} type="button" onClick={checkOpenAIConnection} disabled={aiConnection === 'checking'} aria-label="OpenAI 연결 확인">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h8M17 12v3M20 12v2"/></svg>
+              {aiConnection === 'checking' ? '연결 확인 중…' : aiConnection === 'connected' ? 'AI 연결됨' : aiConnection === 'error' ? '다시 확인' : 'AI 연결 확인'}
+            </button>
+          </div>
+          {aiConnectionMessage && <p className={`ai-connection-message ${aiConnection}`} role="status">{aiConnection === 'connected' && aiConnectionModel ? '✓ ' : ''}{aiConnectionMessage}</p>}
           <div className="url-form"><input value={url} onChange={(e) => { setUrl(e.target.value); setLoadError('') }} onKeyDown={(e) => e.key === 'Enter' && !loading && startLearning()} placeholder="YouTube 링크를 붙여넣으세요" aria-label="유튜브 링크" aria-invalid={Boolean(loadError)} /><button onClick={startLearning} disabled={loading}>{loading ? <><span className="spinner" />분석 중</> : '학습 시작 →'}</button></div>
           {loadError && <p className="url-error" role="alert">{loadError}</p>}
         </section>

@@ -230,6 +230,41 @@ main {
   gap: 18px;
 }
 
+.ai-connection-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 13px;
+  color: #52645a;
+  background: #fff;
+  border: 1px solid #dfe5e1;
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .2s, border-color .2s, color .2s;
+}
+
+.ai-connection-button:hover { background: #f5f8f6; border-color: #cbd7d0; }
+.ai-connection-button:disabled { cursor: wait; opacity: .72; }
+.ai-connection-button svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ai-connection-button.connected { color: #285b42; background: #edf6f0; border-color: #cce2d4; }
+.ai-connection-button.error { color: #a4493e; background: #fff8f7; border-color: #eccbc6; }
+
+.ai-connection-message {
+  margin: -8px 2px -4px;
+  color: #6f7772;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ai-connection-message.connected { color: #47735c; }
+.ai-connection-message.error { color: #b84e40; }
+
 .url-copy .play-dot {
   background: #f2f6f3;
 }
@@ -561,6 +596,7 @@ footer {
   .mini-journey { width: 100%; }
   .url-card { padding: 18px; gap: 14px; }
   .url-card-head { align-items: flex-start; }
+  .ai-connection-button { min-height: 36px; padding-inline: 10px; }
   .url-form { margin-top: 0; }
   .url-form button { min-width: 100px; }
   .video-frame h2 { max-width: 68%; font-size: clamp(34px, 10vw, 48px); }
