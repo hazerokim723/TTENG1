@@ -1226,3 +1226,225 @@ footer {
   .c1-definition { display: inline-flex; margin-block: 3px; }
   .word-popover { width: min(240px, calc(100vw - 28px)); }
 }
+
+/* MY page: reuses the existing quiet card and profile control language. */
+.avatar {
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+
+.avatar:hover,
+.avatar:focus-visible {
+  outline: 0;
+  background: #c9dfd0;
+  transform: translateY(-1px);
+}
+
+.avatar.active {
+  color: #fff;
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(35, 76, 59, .1);
+}
+
+.my-page {
+  min-height: 480px;
+  padding: 46px 52px;
+}
+
+.my-page-heading {
+  padding-bottom: 24px;
+  border-bottom: 1px solid #e7eae7;
+}
+
+.my-page-heading h2 {
+  margin: 5px 0 8px;
+  font-size: 30px;
+  letter-spacing: -.04em;
+}
+
+.my-page-heading p {
+  margin: 0;
+  color: #7a827d;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.my-login-state {
+  display: flex;
+  min-height: 300px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.my-login-mark,
+.my-profile-fallback {
+  display: grid;
+  width: 66px;
+  height: 66px;
+  place-items: center;
+  border-radius: 50%;
+  color: #496d59;
+  background: #eaf1ec;
+}
+
+.my-login-mark svg {
+  width: 28px;
+  height: 28px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.my-login-state h3 {
+  margin: 17px 0 7px;
+  font-size: 19px;
+  letter-spacing: -.025em;
+}
+
+.my-login-state > p {
+  max-width: 390px;
+  margin: 0;
+  color: #7b837e;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.google-login {
+  display: inline-flex;
+  min-width: 220px;
+  height: 46px;
+  align-items: center;
+  justify-content: center;
+  gap: 11px;
+  margin-top: 22px;
+  padding: 0 20px;
+  border: 1px solid #d9dfdb;
+  border-radius: 11px;
+  color: #2f3933;
+  background: #fff;
+  box-shadow: 0 3px 12px rgba(30, 49, 39, .05);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  transition: background .16s ease, border-color .16s ease, transform .16s ease;
+}
+
+.google-login svg {
+  width: 18px;
+  height: 18px;
+}
+
+.google-login:hover:not(:disabled),
+.google-login:focus-visible:not(:disabled) {
+  outline: 0;
+  border-color: #bdcbc2;
+  background: #f8faf8;
+  transform: translateY(-1px);
+}
+
+.google-login:disabled {
+  cursor: default;
+  opacity: .55;
+}
+
+.my-config-note {
+  margin-top: 12px;
+  color: #9a6e45;
+  font-size: 9px;
+}
+
+.my-profile {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  margin-top: 28px;
+  padding: 24px;
+  border: 1px solid #e2e7e3;
+  border-radius: 15px;
+  background: #f9fbf9;
+}
+
+.my-profile > img,
+.my-profile-fallback {
+  width: 72px;
+  height: 72px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  object-fit: cover;
+  box-shadow: 0 2px 12px rgba(31, 52, 40, .1);
+}
+
+.my-profile-fallback {
+  color: #345844;
+  font-size: 24px;
+  font-weight: 750;
+}
+
+.my-profile-copy small {
+  color: #759080;
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+
+.my-profile-copy h3 {
+  margin: 5px 0 3px;
+  font-size: 19px;
+}
+
+.my-profile-copy p {
+  margin: 0;
+  color: #7a827d;
+  font-size: 11px;
+}
+
+.my-logout {
+  min-width: 86px;
+  height: 38px;
+  padding: 0 15px;
+  border: 1px solid #d9dfdb;
+  border-radius: 9px;
+  color: #5f6963;
+  background: #fff;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.my-logout:hover:not(:disabled) { background: #f1f4f2; }
+.my-logout:disabled { opacity: .55; }
+.my-auth-error { margin: 14px 0 0; color: #b45143; font-size: 10px; text-align: center; }
+.my-auth-loading { display: flex; min-height: 290px; align-items: center; justify-content: center; gap: 8px; color: #718078; font-size: 11px; }
+.my-auth-loading .spinner { width: 14px; height: 14px; margin: 0; border-color: #d7dfda; border-top-color: #537863; }
+
+@media (max-width: 700px) {
+  .header-inner .user-block {
+    display: flex;
+    flex: 0 0 auto;
+    min-width: auto;
+    margin-left: 5px;
+  }
+
+  .avatar {
+    width: 35px;
+    height: 35px;
+    font-size: 11px;
+  }
+
+  .my-page {
+    min-height: 430px;
+    padding: 30px 20px;
+  }
+
+  .my-page-heading h2 { font-size: 25px; }
+  .my-login-state { min-height: 280px; }
+  .my-profile { grid-template-columns: 58px minmax(0, 1fr); padding: 18px; }
+  .my-profile > img,
+  .my-profile-fallback { width: 58px; height: 58px; }
+  .my-logout { grid-column: 1 / -1; width: 100%; }
+}

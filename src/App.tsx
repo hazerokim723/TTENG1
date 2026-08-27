@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent, type ReactNode } from 'react'
+import type { User } from '@supabase/supabase-js'
+import { isSupabaseConfigured, supabase } from './supabase'
 
-type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey'
+type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey' | 'my'
 type SavedSentence = { id: number; time: string; text: string }
 type HighlightColor = 'yellow'
 type Highlight = { id: number; line: number; start: number; end: number; color: HighlightColor; text: string }
@@ -105,7 +107,7 @@ const sampleTranscript: TranscriptBlock[] = [
   { timestamp_sec: 282, end_sec: 294, timestamp_display: '04:42', text: 'Those decisions can reshape relationships between institutions and the people whose histories they hold.' },
 ]
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v1'
 const PREFETCH_STOP_WORDS = new Set([
   'about', 'after', 'again', 'also', 'another', 'because', 'before', 'being', 'between', 'could', 'does', 'from', 'have', 'into', 'just', 'more', 'most', 'other', 'over', 'same', 'some', 'such', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'with', 'would', 'your',
@@ -135,6 +137,7 @@ function MenuIcon({ id }: { id: Tab }) {
     bag: <><path d="M6 8h12l1 12H5L6 8z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></>,
     vault: <><path d="M6 4h12v16H6z"/><path d="M9 8h6M9 12h6M9 16h4"/></>,
     journey: <><path d="M5 18c3-8 7-11 14-12"/><path d="m14 5 5 1-1 5"/><circle cx="6" cy="18" r="2"/></>,
+    my: <><circle cx="12" cy="8" r="3.5"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/></>,
   }
   return <svg viewBox="0 0 24 24" aria-hidden="true">{paths[id]}</svg>
 }
@@ -213,7 +216,7 @@ function OpenAIKeyModal({ onClose, onSaved }: { onClose: () => void; onSaved: ()
 }
 
 function App() {
-  const [tab, setTab] = useState<Tab>('dictation')
+  const [tab, setTab] = useState<Tab>(() => new URLSearchParams(window.location.search).get('view') === 'my' ? 'my' : 'dictation')
   const [url, setUrl] = useState('https://youtu.be/ELI8AwyXF1Q')
   const [loaded, setLoaded] = useState(true)
   const [loading, setLoading] = useState(false)
@@ -237,12 +240,48 @@ function App() {
   const [quizIndex, setQuizIndex] = useState(0)
   const [toast, setToast] = useState('')
   const [showApiSettings, setShowApiSettings] = useState(false)
+  const [authUser, setAuthUser] = useState<User | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+
+  function navigateTo(nextTab: Tab) {
+    setTab(nextTab)
+    const nextUrl = new URL(window.location.href)
+    if (nextTab === 'my') nextUrl.searchParams.set('view', 'my')
+    else nextUrl.searchParams.delete('view')
+    nextUrl.searchParams.delete('code')
+    window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`)
+  }
 
   useEffect(() => { localStorage.setItem('turtle-progress', String(progress)) }, [progress])
   useEffect(() => { localStorage.setItem('turtle-highlights', JSON.stringify(highlights)) }, [highlights])
   useEffect(() => { localStorage.setItem('turtle-vault', JSON.stringify(saved)) }, [saved])
   useEffect(() => { localStorage.setItem('turtle-bag', JSON.stringify(bag)) }, [bag])
   useEffect(() => { localStorage.setItem('turtle-completed-words', JSON.stringify(completedWords)) }, [completedWords])
+
+  useEffect(() => {
+    if (!supabase) {
+      setAuthLoading(false)
+      return
+    }
+
+    let active = true
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return
+      setAuthUser(data.session?.user ?? null)
+      setAuthLoading(false)
+    })
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!active) return
+      setAuthUser(session?.user ?? null)
+      setAuthLoading(false)
+    })
+
+    return () => {
+      active = false
+      listener.subscription.unsubscribe()
+    }
+  }, [])
 
   useEffect(() => {
     if (!episodeId || !['pending', 'running'].includes(analysisStatus)) return
@@ -304,7 +343,7 @@ function App() {
       setQuizIndex(0)
       setLoading(false)
       setLoaded(true)
-      setTab('dictation')
+      navigateTo('dictation')
       flash(data.analysis_status === 'complete'
         ? `B2·C1 학습 표현 ${data.learning_items.length}개를 준비했어요`
         : '전체 스크립트를 먼저 준비했어요')
@@ -370,9 +409,9 @@ function App() {
             <span>Turtle English</span>
           </a>
           <nav aria-label="학습 메뉴">
-            {tabs.map((item) => <button key={item.id} className={tab === item.id ? 'active' : ''} onClick={() => setTab(item.id)}><MenuIcon id={item.id} />{item.label}{item.id === 'bag' && bag.length > 0 && <em>{bag.length}</em>}</button>)}
+            {tabs.map((item) => <button key={item.id} className={tab === item.id ? 'active' : ''} onClick={() => navigateTo(item.id)}><MenuIcon id={item.id} />{item.label}{item.id === 'bag' && bag.length > 0 && <em>{bag.length}</em>}</button>)}
           </nav>
-          <div className="user-block"><button className="avatar" aria-label="프로필">MJ</button></div>
+          <div className="user-block"><button className={`avatar ${tab === 'my' ? 'active' : ''}`} aria-label="MY 페이지" aria-current={tab === 'my' ? 'page' : undefined} onClick={() => navigateTo('my')}>MY</button></div>
         </div>
       </header>
 
@@ -391,14 +430,86 @@ function App() {
         {loaded && <section className="workspace">
           {tab === 'dictation' && <Dictation episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} saveSentence={saveSentence} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} />}
           {tab === 'quiz' && <Quiz item={learningItems[quizIndex]} index={quizIndex} total={learningItems.length} answer={answer} setAnswer={setAnswer} state={quizState} submit={submitQuiz} next={() => { setAnswer(''); setQuizState('idle'); setQuizIndex((quizIndex + 1) % learningItems.length) }} />}
-          {tab === 'bag' && <Bag words={bag} items={learningItems} practice={() => setTab('quiz')} />}
+          {tab === 'bag' && <Bag words={bag} items={learningItems} practice={() => navigateTo('quiz')} />}
           {tab === 'vault' && <Vault sentences={saved} remove={(id) => setSaved(saved.filter((s) => s.id !== id))} />}
           {tab === 'journey' && <Journey progress={progress} />}
+          {tab === 'my' && <MyPage user={authUser} loading={authLoading} configured={isSupabaseConfigured} onMessage={flash} />}
         </section>}
       </main>
       <footer><small>© 2026 Turtle English</small></footer>
     </div>
   )
+}
+
+function MyPage({ user, loading, configured, onMessage }: { user: User | null; loading: boolean; configured: boolean; onMessage: (message: string) => void }) {
+  const [action, setAction] = useState<'idle' | 'login' | 'logout'>('idle')
+  const [error, setError] = useState('')
+
+  async function continueWithGoogle() {
+    if (!supabase || !configured) {
+      setError('Supabase 환경변수를 먼저 설정해 주세요.')
+      return
+    }
+
+    setAction('login')
+    setError('')
+    const { error: signInError } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: `${window.location.origin}/?view=my`,
+      },
+    })
+
+    if (signInError) {
+      setAction('idle')
+      setError(signInError.message)
+    }
+  }
+
+  async function signOut() {
+    if (!supabase) return
+    setAction('logout')
+    setError('')
+    const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' })
+    setAction('idle')
+    if (signOutError) {
+      setError(signOutError.message)
+      return
+    }
+    onMessage('로그아웃했어요')
+  }
+
+  const metadata = user?.user_metadata as Record<string, unknown> | undefined
+  const profileImage = typeof metadata?.avatar_url === 'string'
+    ? metadata.avatar_url
+    : typeof metadata?.picture === 'string' ? metadata.picture : ''
+  const displayName = typeof metadata?.full_name === 'string'
+    ? metadata.full_name
+    : typeof metadata?.name === 'string' ? metadata.name : user?.email?.split('@')[0] || 'Turtle English 사용자'
+
+  return <section className="center-panel my-page" aria-labelledby="my-page-title">
+    <div className="my-page-heading">
+      <span className="eyebrow">MY PAGE</span>
+      <h2 id="my-page-title">나의 Turtle English</h2>
+      <p>로그인하면 여러 기기에서도 같은 Google 계정으로 나를 확인할 수 있어요.</p>
+    </div>
+
+    {loading ? <div className="my-auth-loading" role="status"><span className="spinner" />로그인 상태를 확인하고 있어요</div> : user ? <div className="my-profile">
+      {profileImage ? <img src={profileImage} alt={`${displayName} 프로필`} referrerPolicy="no-referrer" /> : <span className="my-profile-fallback" aria-hidden="true">{displayName.slice(0, 1).toUpperCase()}</span>}
+      <div className="my-profile-copy"><small>GOOGLE ACCOUNT</small><h3>{displayName}</h3><p>{user.email}</p></div>
+      <button className="my-logout" type="button" onClick={signOut} disabled={action === 'logout'}>{action === 'logout' ? '로그아웃 중…' : '로그아웃'}</button>
+    </div> : <div className="my-login-state">
+      <div className="my-login-mark" aria-hidden="true"><MenuIcon id="my" /></div>
+      <h3>필요할 때만 로그인하세요</h3>
+      <p>로그인하지 않아도 받아쓰기와 모든 학습 기능을 계속 사용할 수 있어요.</p>
+      <button className="google-login" type="button" onClick={continueWithGoogle} disabled={action === 'login' || !configured}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M21.6 12.23c0-.71-.06-1.4-.18-2.07H12v3.91h5.38a4.6 4.6 0 0 1-2 3.02v2.54h3.24c1.9-1.75 2.98-4.33 2.98-7.4Z"/><path fill="#34A853" d="M12 22c2.7 0 4.97-.9 6.62-2.42l-3.24-2.54c-.9.6-2.05.96-3.38.96-2.6 0-4.81-1.76-5.6-4.13H3.06v2.62A10 10 0 0 0 12 22Z"/><path fill="#FBBC05" d="M6.4 13.87A6.02 6.02 0 0 1 6.09 12c0-.65.11-1.28.31-1.87V7.51H3.06A10 10 0 0 0 2 12c0 1.61.39 3.14 1.06 4.49l3.34-2.62Z"/><path fill="#EA4335" d="M12 6c1.47 0 2.79.5 3.83 1.5l2.87-2.87A9.63 9.63 0 0 0 12 2a10 10 0 0 0-8.94 5.51l3.34 2.62C7.19 7.76 9.4 6 12 6Z"/></svg>
+        {action === 'login' ? 'Google로 이동 중…' : 'Google로 계속하기'}
+      </button>
+      {!configured && <small className="my-config-note">Vercel에 Supabase 환경변수를 추가하면 로그인 버튼이 활성화됩니다.</small>}
+    </div>}
+    {error && <p className="my-auth-error" role="alert">{error}</p>}
+  </section>
 }
 
 function formatPlayerTime(seconds: number) {
