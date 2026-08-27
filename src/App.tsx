@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 
@@ -967,26 +968,49 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }
 
   function handleSelection(event: PointerEvent<HTMLParagraphElement>, line: number, rawText: string) {
-    const selection = window.getSelection()
     const paragraph = event.currentTarget
-    if (!selection || selection.isCollapsed || !selection.rangeCount) return
-    const range = selection.getRangeAt(0)
-    if (!paragraph.contains(range.commonAncestorContainer)) return
-    const prefix = range.cloneRange()
-    prefix.selectNodeContents(paragraph)
-    prefix.setEnd(range.startContainer, range.startOffset)
-    const start = prefix.toString().length
-    const selectedLength = range.toString().length
-    if (!selectedLength || !range.toString().trim()) return
-    const end = Math.min(rawText.length, start + selectedLength)
-    const edgePadding = window.innerWidth < 520 ? 68 : 76
-    const rangeRect = range.getBoundingClientRect()
-    const releaseX = event.clientX || rangeRect.left + rangeRect.width / 2
-    const releaseY = event.clientY || rangeRect.top
-    const x = Math.max(edgePadding, Math.min(releaseX, window.innerWidth - edgePadding))
-    const placement = releaseY < 92 ? 'below' : 'above'
-    const y = placement === 'below' ? releaseY + 14 : releaseY
-    setPalette({ line, start, end, text: rawText.slice(start, end), x, y, placement })
+    const pointerX = event.clientX
+    const pointerY = event.clientY
+
+    // Native selection settles after pointerup. Read it on the next frame so the
+    // palette always follows the actual release end, including multi-line ranges.
+    window.requestAnimationFrame(() => {
+      const selection = window.getSelection()
+      if (!selection || selection.isCollapsed || !selection.rangeCount) {
+        setPalette(null)
+        return
+      }
+      const range = selection.getRangeAt(0)
+      if (!paragraph.contains(range.commonAncestorContainer)) {
+        setPalette(null)
+        return
+      }
+      const prefix = range.cloneRange()
+      prefix.selectNodeContents(paragraph)
+      prefix.setEnd(range.startContainer, range.startOffset)
+      const start = prefix.toString().length
+      const selectedLength = range.toString().length
+      if (!selectedLength || !range.toString().trim()) {
+        setPalette(null)
+        return
+      }
+      const end = Math.min(rawText.length, start + selectedLength)
+      const selectionRects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+      const rangeRect = range.getBoundingClientRect()
+      const releaseX = pointerX || rangeRect.right
+      const releaseY = pointerY || rangeRect.bottom
+      const releaseLine = selectionRects.reduce<DOMRect | null>((closest, rect) => {
+        if (!closest) return rect
+        const distance = releaseY < rect.top ? rect.top - releaseY : releaseY > rect.bottom ? releaseY - rect.bottom : 0
+        const closestDistance = releaseY < closest.top ? closest.top - releaseY : releaseY > closest.bottom ? releaseY - closest.bottom : 0
+        return distance < closestDistance ? rect : closest
+      }, null) || rangeRect
+      const edgePadding = window.innerWidth < 520 ? 48 : 52
+      const x = Math.max(edgePadding, Math.min(releaseX, window.innerWidth - edgePadding))
+      const placement = releaseLine.top < 58 ? 'below' : 'above'
+      const y = placement === 'below' ? releaseLine.bottom + 12 : releaseLine.top
+      setPalette({ line, start, end, text: rawText.slice(start, end), x, y, placement })
+    })
   }
 
   function colorSelection() {
@@ -1080,15 +1104,15 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
         {!transcript.length && <div className="empty-state">YouTube에서 사용할 수 있는 영어 자막을 제공하지 않아 전체 스크립트를 만들 수 없습니다.<br /><small>영상은 위 플레이어에서 그대로 재생할 수 있어요.</small></div>}
         {transcript.map((line, index) => <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`} onClick={(event) => playFromTranscript(event, line.timestamp_sec)}>
           <span className="timestamp">{line.timestamp_display}</span>
-          <div className="script-copy"><p onPointerUp={(event) => handleSelection(event, index, line.text)}><InteractiveScriptText text={line.text} c1Items={c1ItemsForBlock(line)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event) => openWord(word, event, line.text)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading === index && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
+          <div className="script-copy"><p onPointerDown={() => setPalette(null)} onPointerUp={(event) => handleSelection(event, index, line.text)}><InteractiveScriptText text={line.text} c1Items={c1ItemsForBlock(line)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event) => openWord(word, event, line.text)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading === index && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
         </div>)}
       </div>
       <div className="script-tip"><span>⌁</span><p><b>Tip.</b> 블록의 빈 곳을 누르면 그 시점부터 재생해요. B2·C1 빈칸은 한 번 눌러 입력하고, 두 번 눌러 정답을 확인할 수 있어요.</p></div>
-      {palette && <div className={`selection-palette ${palette.placement}`} style={{ left: palette.x, top: palette.y }} role="toolbar" aria-label="선택한 텍스트 도구">
+      {palette && createPortal(<div className={`selection-palette ${palette.placement}`} style={{ left: palette.x, top: palette.y }} role="toolbar" aria-label="선택한 텍스트 도구">
         <button className="selection-tool highlight-tool" onPointerDown={(event) => event.preventDefault()} onClick={colorSelection} aria-label="노란색 형광펜 적용 또는 해제">○</button>
         <span className="selection-divider" aria-hidden="true" />
         <button className="selection-tool translation-tool" onPointerDown={(event) => event.preventDefault()} onClick={toggleTranslation} aria-label="한국어 번역 펼치기 또는 접기">한</button>
-      </div>}
+      </div>, document.body)}
       {wordPopover && <aside className="word-popover" style={{ left: wordPopover.x, top: wordPopover.y }} role="status">
         <button onClick={() => setWordPopover(null)} aria-label="단어 뜻 닫기">×</button>
         <b>{wordPopover.data.word}</b><small>{wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>{wordPopover.loading && <i className="popover-loader" />}
