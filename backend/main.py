@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Literal
@@ -31,7 +32,15 @@ VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 TRANSCRIPT_CHUNK_CHARACTER_LIMIT = 28_000
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ANALYSIS_VERSION = "b2-c1-phrasal-v1"
-CACHE_DIRECTORY = Path(__file__).resolve().parent / ".cache"
+IS_VERCEL = bool(os.getenv("VERCEL"))
+CACHE_DIRECTORY = Path(
+    os.getenv("TURTLE_CACHE_DIRECTORY")
+    or (
+        Path(tempfile.gettempdir()) / "turtle-english"
+        if IS_VERCEL
+        else Path(__file__).resolve().parent / ".cache"
+    )
+)
 WORD_CACHE_VERSION = "context-dictionary-v1"
 WORD_CACHE_PATH = CACHE_DIRECTORY / f"{WORD_CACHE_VERSION}.json"
 
@@ -819,11 +828,21 @@ async def analyze_episode(
             "error": None,
         }
         request.app.state.analysis_jobs[video_id] = job
-        task = asyncio.create_task(
-            run_analysis_job(video_id, title, source_name, transcript, chunks, api_key)
-        )
-        request.app.state.analysis_tasks.add(task)
-        task.add_done_callback(request.app.state.analysis_tasks.discard)
+        if IS_VERCEL:
+            # A Vercel Function can be frozen as soon as its response is returned.
+            # Finish the analysis in this invocation instead of relying on an
+            # in-memory background task that may disappear between requests.
+            await run_analysis_job(
+                video_id, title, source_name, transcript, chunks, api_key
+            )
+        else:
+            task = asyncio.create_task(
+                run_analysis_job(
+                    video_id, title, source_name, transcript, chunks, api_key
+                )
+            )
+            request.app.state.analysis_tasks.add(task)
+            task.add_done_callback(request.app.state.analysis_tasks.discard)
     return AnalyzeEpisodeResponse(
         episode_id=video_id,
         title=title,

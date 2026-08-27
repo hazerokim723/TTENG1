@@ -22,6 +22,7 @@ type TranscriptBlock = { timestamp_sec: number; end_sec: number; timestamp_displ
 type WordDefinition = { word: string; word_type: string; definition_kr: string }
 type TranslationResponse = { translation_kr: string }
 type OpenAIConnectionResponse = { status: 'connected'; model: string }
+type ApiErrorResponse = { detail?: string }
 type AnalyzeResponse = {
   episode_id: string
   title: string
@@ -139,6 +140,23 @@ function loadStoredAIConnection() {
   } catch {
     return null
   }
+}
+
+async function readApiJson<T>(response: Response): Promise<T | ApiErrorResponse | null> {
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('application/json')) {
+    return await response.json().catch(() => null) as T | ApiErrorResponse | null
+  }
+
+  const body = await response.text().catch(() => '')
+  const looksLikeLoginPage = /<html|<!doctype/i.test(body) && /log\s*in|sign\s*in|vercel authentication|sso/i.test(body)
+  if (looksLikeLoginPage) {
+    throw new Error('배포 서버가 API 대신 로그인 페이지를 반환했습니다. Vercel 배포 보호 설정을 확인해 주세요.')
+  }
+  if (response.status === 404) {
+    throw new Error('배포 서버에서 API 경로를 찾지 못했습니다. 최신 배포가 완료되었는지 확인해 주세요.')
+  }
+  throw new Error(`API 서버가 예상하지 못한 형식으로 응답했습니다. (상태 ${response.status})`)
 }
 
 function MenuIcon({ id }: { id: Tab }) {
@@ -264,11 +282,7 @@ function App() {
     setAiConnectionMessage('OpenAI에 실제 요청을 보내 확인하고 있어요…')
     try {
       const response = await fetch(`${API_BASE_URL}/api/openai/validate`, { method: 'POST' })
-      const isJson = response.headers.get('content-type')?.includes('application/json')
-      const data = isJson
-        ? await response.json().catch(() => null) as OpenAIConnectionResponse | { detail?: string } | null
-        : null
-      if (!isJson) throw new Error('배포 서버가 API 응답 대신 로그인 페이지를 반환했습니다. Vercel 배포 보호 설정을 확인해 주세요.')
+      const data = await readApiJson<OpenAIConnectionResponse>(response)
       if (!response.ok) throw new Error((data && 'detail' in data && data.detail) || 'OpenAI 연결 확인에 실패했습니다.')
       if (!data || !('status' in data) || data.status !== 'connected') throw new Error('OpenAI 연결 결과를 확인하지 못했습니다.')
 
@@ -300,7 +314,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ youtube_url: value }),
       })
-      const data = await response.json().catch(() => null) as AnalyzeResponse | { detail?: string } | null
+      const data = await readApiJson<AnalyzeResponse>(response)
       if (!response.ok) throw new Error((data && 'detail' in data && data.detail) || '영상 분석에 실패했습니다.')
       if (!data || !('transcript' in data) || !Array.isArray(data.transcript) || data.transcript.length === 0) {
         throw new Error('이 영상에서 학습할 자막을 찾지 못했습니다.')
