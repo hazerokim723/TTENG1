@@ -21,10 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     CouldNotRetrieveTranscript,
+    IpBlocked,
     NoTranscriptFound,
+    RequestBlocked,
     TranscriptsDisabled,
     VideoUnavailable,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 
 load_dotenv()
 
@@ -101,6 +104,22 @@ class AnalysisStatusResponse(BaseModel):
     completed_chunks: int = 0
     total_chunks: int = 0
     error: str | None = None
+
+
+class AnalyzeChunkRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    episode_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
+    chunk_index: int = Field(ge=0)
+    total_chunks: int = Field(ge=1, le=100)
+    transcript_chunk: str = Field(min_length=1, max_length=40_000)
+
+
+class AnalyzeChunkResponse(BaseModel):
+    chunk_index: int
+    total_chunks: int
+    analysis_version: str
+    learning_items: list[LearningItem] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -199,7 +218,31 @@ def format_timestamp(seconds: float) -> str:
 
 
 def fetch_caption_entries(video_id: str) -> list[tuple[float, str]]:
-    transcript = YouTubeTranscriptApi().fetch(video_id, languages=["en"])
+    webshare_username = os.getenv("WEBSHARE_PROXY_USERNAME", "").strip()
+    webshare_password = os.getenv("WEBSHARE_PROXY_PASSWORD", "").strip()
+    generic_proxy_url = os.getenv("YOUTUBE_PROXY_URL", "").strip()
+    proxy_config = None
+    if webshare_username and webshare_password:
+        locations = [
+            location.strip().lower()
+            for location in os.getenv("WEBSHARE_PROXY_LOCATIONS", "us,kr,jp").split(",")
+            if location.strip()
+        ]
+        proxy_config = WebshareProxyConfig(
+            proxy_username=webshare_username,
+            proxy_password=webshare_password,
+            filter_ip_locations=locations or None,
+            retries_when_blocked=5,
+        )
+    elif generic_proxy_url:
+        proxy_config = GenericProxyConfig(
+            http_url=generic_proxy_url,
+            https_url=generic_proxy_url,
+        )
+
+    transcript = YouTubeTranscriptApi(proxy_config=proxy_config).fetch(
+        video_id, languages=["en"]
+    )
     entries = [
         (float(snippet.start), snippet.text.strip())
         for snippet in transcript
@@ -755,7 +798,7 @@ async def prefetch_word_definitions(
 
 @app.post("/api/episodes/analyze", response_model=AnalyzeEpisodeResponse)
 async def analyze_episode(
-    payload: AnalyzeEpisodeRequest, request: Request
+    payload: AnalyzeEpisodeRequest,
 ) -> AnalyzeEpisodeResponse:
     try:
         video_id = extract_video_id(payload.youtube_url)
@@ -795,10 +838,21 @@ async def analyze_episode(
             status_code=400,
             detail="이 영상에서 사용 가능한 영어 자막을 찾을 수 없습니다.",
         ) from error
+    except (RequestBlocked, IpBlocked) as error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "YouTube가 배포 서버의 자막 요청을 차단했습니다. "
+                "Vercel에 주거용 프록시 환경변수를 설정해 주세요."
+            ),
+        ) from error
     except CouldNotRetrieveTranscript as error:
         raise HTTPException(
             status_code=400,
-            detail="YouTube 자막을 가져오지 못했습니다. 영상 공개 상태와 자막을 확인해 주세요.",
+            detail=(
+                "자막이 없거나 YouTube가 배포 서버의 자막 요청을 차단했습니다. "
+                "IFrame API는 영상 재생만 제공하므로 영어 자막(CC)이 있는 영상을 사용해 주세요."
+            ),
         ) from error
     except Exception as error:
         raise HTTPException(
@@ -810,51 +864,65 @@ async def analyze_episode(
     transcript = build_transcript_blocks(entries)
     chunks = chunk_transcript(entries)
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="서버의 AI 분석 기능이 아직 준비되지 않았습니다.",
-        )
-
-    existing_job = request.app.state.analysis_jobs.get(video_id)
-    if existing_job and existing_job["status"] in {"pending", "running", "complete"}:
-        job = existing_job
-    else:
-        job = {
-            "status": "pending",
-            "items": [],
-            "completed_chunks": 0,
-            "total_chunks": len(chunks),
-            "error": None,
-        }
-        request.app.state.analysis_jobs[video_id] = job
-        if IS_VERCEL:
-            # A Vercel Function can be frozen as soon as its response is returned.
-            # Finish the analysis in this invocation instead of relying on an
-            # in-memory background task that may disappear between requests.
-            await run_analysis_job(
-                video_id, title, source_name, transcript, chunks, api_key
-            )
-        else:
-            task = asyncio.create_task(
-                run_analysis_job(
-                    video_id, title, source_name, transcript, chunks, api_key
-                )
-            )
-            request.app.state.analysis_tasks.add(task)
-            task.add_done_callback(request.app.state.analysis_tasks.discard)
     return AnalyzeEpisodeResponse(
         episode_id=video_id,
         title=title,
         source_name=source_name,
         duration_sec=transcript[-1].end_sec if transcript else 0,
         transcript=transcript,
-        learning_items=job["items"],
-        analysis_status=job["status"],
+        learning_items=[],
+        analysis_status="pending" if api_key else "waiting_for_key",
         analysis_version=ANALYSIS_VERSION,
         cached=False,
-        completed_chunks=job["completed_chunks"],
-        total_chunks=job["total_chunks"],
+        completed_chunks=0,
+        total_chunks=len(chunks),
+    )
+
+
+@app.post("/api/episodes/analyze-chunk", response_model=AnalyzeChunkResponse)
+async def analyze_episode_chunk(payload: AnalyzeChunkRequest) -> AnalyzeChunkResponse:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="서버의 AI 분석 기능이 아직 준비되지 않았습니다.",
+        )
+    try:
+        items = await asyncio.to_thread(
+            analyze_chunk,
+            payload.transcript_chunk,
+            payload.chunk_index + 1,
+            payload.total_chunks,
+            api_key,
+        )
+    except AuthenticationError as error:
+        raise HTTPException(
+            status_code=401, detail="OpenAI API 키가 유효하지 않습니다."
+        ) from error
+    except RateLimitError as error:
+        raise HTTPException(
+            status_code=429,
+            detail="OpenAI 사용 한도 또는 요청 한도를 초과했습니다.",
+        ) from error
+    except APIConnectionError as error:
+        raise HTTPException(
+            status_code=502, detail="OpenAI API에 연결할 수 없습니다."
+        ) from error
+    except APIStatusError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=f"OpenAI 분석 요청이 실패했습니다. (상태 {error.status_code})",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502, detail="학습 단어 분석을 완료하지 못했습니다."
+        ) from error
+
+    return AnalyzeChunkResponse(
+        chunk_index=payload.chunk_index,
+        total_chunks=payload.total_chunks,
+        analysis_version=ANALYSIS_VERSION,
+        learning_items=items,
     )
 
 

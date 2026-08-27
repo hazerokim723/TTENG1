@@ -37,7 +37,16 @@ type AnalyzeResponse = {
   total_chunks: number
 }
 type AnalysisStatus = 'waiting_for_key' | 'pending' | 'running' | 'complete' | 'error'
-type AnalysisResponse = Pick<AnalyzeResponse, 'episode_id' | 'analysis_status' | 'analysis_version' | 'learning_items' | 'completed_chunks' | 'total_chunks'> & { error?: string }
+type AnalyzeChunkResponse = Pick<AnalyzeResponse, 'analysis_version' | 'learning_items' | 'total_chunks'> & { chunk_index: number }
+type EpisodeAnalysisCache = {
+  analysisVersion: string
+  episodeId: string
+  title: string
+  sourceName: string
+  durationSec: number
+  transcript: TranscriptBlock[]
+  learningItems: LearningItem[]
+}
 type YouTubePlayerInstance = {
   playVideo: () => void
   pauseVideo: () => void
@@ -112,6 +121,8 @@ const sampleTranscript: TranscriptBlock[] = [
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v1'
 const AI_CONNECTION_STORAGE_KEY = 'turtle-openai-connection-v1'
+const ANALYSIS_VERSION = 'b2-c1-phrasal-v1'
+const EPISODE_CACHE_PREFIX = 'turtle-episode-analysis'
 const PREFETCH_STOP_WORDS = new Set([
   'about', 'after', 'again', 'also', 'another', 'because', 'before', 'being', 'between', 'could', 'does', 'from', 'have', 'into', 'just', 'more', 'most', 'other', 'over', 'same', 'some', 'such', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'with', 'would', 'your',
 ])
@@ -140,6 +151,78 @@ function loadStoredAIConnection() {
   } catch {
     return null
   }
+}
+
+function extractYouTubeVideoId(value: string) {
+  const match = value.trim().match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/)([A-Za-z0-9_-]{11})/)
+  return match?.[1] || (/^[A-Za-z0-9_-]{11}$/.test(value.trim()) ? value.trim() : '')
+}
+
+function episodeCacheKey(videoId: string) {
+  return `${EPISODE_CACHE_PREFIX}-${videoId}-${ANALYSIS_VERSION}`
+}
+
+function loadEpisodeAnalysisCache(videoId: string): AnalyzeResponse | null {
+  try {
+    const cached = JSON.parse(localStorage.getItem(episodeCacheKey(videoId)) || 'null') as EpisodeAnalysisCache | null
+    if (!cached || cached.analysisVersion !== ANALYSIS_VERSION || !Array.isArray(cached.transcript) || !cached.transcript.length || !Array.isArray(cached.learningItems)) return null
+    return {
+      episode_id: cached.episodeId,
+      title: cached.title,
+      source_name: cached.sourceName,
+      duration_sec: cached.durationSec,
+      transcript: cached.transcript,
+      learning_items: cached.learningItems,
+      analysis_status: 'complete',
+      analysis_version: cached.analysisVersion,
+      cached: true,
+      completed_chunks: 1,
+      total_chunks: 1,
+    }
+  } catch {
+    return null
+  }
+}
+
+function storeEpisodeAnalysisCache(data: AnalyzeResponse, learningItems: LearningItem[]) {
+  try {
+    const cache: EpisodeAnalysisCache = {
+      analysisVersion: data.analysis_version,
+      episodeId: data.episode_id,
+      title: data.title,
+      sourceName: data.source_name,
+      durationSec: data.duration_sec,
+      transcript: data.transcript,
+      learningItems,
+    }
+    localStorage.setItem(episodeCacheKey(data.episode_id), JSON.stringify(cache))
+  } catch {
+    // Learning still works when browser storage is unavailable.
+  }
+}
+
+function chunkTranscriptBlocks(blocks: TranscriptBlock[], characterLimit = 24_000) {
+  const chunks: string[] = []
+  let current: string[] = []
+  let size = 0
+  for (const block of blocks) {
+    const line = `[${block.timestamp_sec.toFixed(3)}s] ${block.text}`
+    if (current.length && size + line.length + 1 > characterLimit) {
+      chunks.push(current.join('\n'))
+      current = []
+      size = 0
+    }
+    current.push(line)
+    size += line.length + 1
+  }
+  if (current.length) chunks.push(current.join('\n'))
+  return chunks
+}
+
+function mergeLearningItems(current: LearningItem[], incoming: LearningItem[]) {
+  const unique = new Map<string, LearningItem>()
+  for (const item of [...current, ...incoming]) unique.set(`${Math.round(item.timestamp_sec)}:${item.target_word.toLocaleLowerCase()}`, item)
+  return [...unique.values()].sort((a, b) => a.timestamp_sec - b.timestamp_sec)
 }
 
 async function readApiJson<T>(response: Response): Promise<T | ApiErrorResponse | null> {
@@ -210,6 +293,7 @@ function App() {
   const [aiConnection, setAiConnection] = useState<'unknown' | 'checking' | 'connected' | 'error'>(() => loadStoredAIConnection() ? 'connected' : 'unknown')
   const [aiConnectionModel, setAiConnectionModel] = useState(() => loadStoredAIConnection()?.model || '')
   const [aiConnectionMessage, setAiConnectionMessage] = useState(() => loadStoredAIConnection() ? '서버 키를 자동으로 사용하고 있어요.' : '')
+  const analysisControllerRef = useRef<AbortController | null>(null)
 
   function navigateTo(nextTab: Tab) {
     setTab(nextTab)
@@ -251,29 +335,7 @@ function App() {
     }
   }, [])
 
-  useEffect(() => {
-    if (!episodeId || !['pending', 'running'].includes(analysisStatus)) return
-    let cancelled = false
-    let timer = 0
-    const poll = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/episodes/${episodeId}/analysis`)
-        const data = await response.json().catch(() => null) as AnalysisResponse | { detail?: string } | null
-        if (!response.ok || !data || !('analysis_status' in data)) throw new Error(data && 'detail' in data ? data.detail : '분석 상태를 확인하지 못했습니다.')
-        if (cancelled) return
-        setLearningItems(data.learning_items)
-        setAnalysisStatus(data.analysis_status)
-        setAnalysisProgress({ completed: data.completed_chunks, total: data.total_chunks })
-        if (data.analysis_status === 'complete') flash(`B2·C1 학습 표현 ${data.learning_items.length}개를 준비했어요`)
-        if (data.analysis_status === 'error' && data.error) setLoadError(data.error)
-        if (['pending', 'running'].includes(data.analysis_status)) timer = window.setTimeout(poll, 1200)
-      } catch (error) {
-        if (!cancelled) timer = window.setTimeout(poll, 2200)
-      }
-    }
-    timer = window.setTimeout(poll, 500)
-    return () => { cancelled = true; window.clearTimeout(timer) }
-  }, [analysisStatus, episodeId])
+  useEffect(() => () => analysisControllerRef.current?.abort(), [])
 
   const episodeProgress = useMemo(() => Math.min(100, Math.round((progress / 100) * 100)), [progress])
 
@@ -299,6 +361,57 @@ function App() {
     }
   }
 
+  async function runProgressiveAnalysis(data: AnalyzeResponse) {
+    const chunks = chunkTranscriptBlocks(data.transcript)
+    if (!chunks.length) return
+    analysisControllerRef.current?.abort()
+    const controller = new AbortController()
+    analysisControllerRef.current = controller
+    setAnalysisStatus('running')
+    setAnalysisProgress({ completed: 0, total: chunks.length })
+    let cursor = 0
+    let completed = 0
+    let collected = [...data.learning_items]
+
+    const worker = async () => {
+      while (!controller.signal.aborted) {
+        const chunkIndex = cursor++
+        if (chunkIndex >= chunks.length) return
+        const response = await fetch(`${API_BASE_URL}/api/episodes/analyze-chunk`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            episode_id: data.episode_id,
+            chunk_index: chunkIndex,
+            total_chunks: chunks.length,
+            transcript_chunk: chunks[chunkIndex],
+          }),
+          signal: controller.signal,
+        })
+        const result = await readApiJson<AnalyzeChunkResponse>(response)
+        if (!response.ok || !result || !('learning_items' in result)) {
+          throw new Error((result && 'detail' in result && result.detail) || '학습 단어 분석에 실패했습니다.')
+        }
+        collected = mergeLearningItems(collected, result.learning_items)
+        completed += 1
+        setLearningItems([...collected])
+        setAnalysisProgress({ completed, total: chunks.length })
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => worker()))
+      if (controller.signal.aborted) return
+      setAnalysisStatus('complete')
+      storeEpisodeAnalysisCache(data, collected)
+      flash(`B2·C1 학습 표현 ${collected.length}개를 준비했어요`)
+    } catch (error) {
+      if (controller.signal.aborted) return
+      setAnalysisStatus('error')
+      setLoadError(error instanceof Error ? error.message : '학습 단어 분석에 실패했습니다.')
+    }
+  }
+
   async function startLearning() {
     const value = url.trim()
     const isYouTubeUrl = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?(.*&)?v=|shorts\/|embed\/)|youtu\.be\/)[\w-]{6,}/i.test(value)
@@ -309,6 +422,23 @@ function App() {
     setLoading(true)
     setLoadError('')
     try {
+      const videoId = extractYouTubeVideoId(value)
+      const browserCache = videoId ? loadEpisodeAnalysisCache(videoId) : null
+      if (browserCache) {
+        analysisControllerRef.current?.abort()
+        setEpisodeId(browserCache.episode_id)
+        setEpisodeTitle(browserCache.title)
+        setSourceName(browserCache.source_name)
+        setDurationSec(browserCache.duration_sec)
+        setTranscript(browserCache.transcript)
+        setLearningItems(browserCache.learning_items)
+        setAnalysisStatus('complete')
+        setAnalysisProgress({ completed: 1, total: 1 })
+        setLoaded(true)
+        navigateTo('dictation')
+        flash('저장된 분석 결과를 바로 불러왔어요')
+        return
+      }
       const response = await fetch(`${API_BASE_URL}/api/episodes/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -334,13 +464,32 @@ function App() {
       setLoading(false)
       setLoaded(true)
       navigateTo('dictation')
-      flash(data.analysis_status === 'complete'
-        ? `B2·C1 학습 표현 ${data.learning_items.length}개를 준비했어요`
-        : '전체 스크립트를 먼저 준비했어요')
+      if (data.analysis_status === 'complete') {
+        storeEpisodeAnalysisCache(data, data.learning_items)
+        flash(`B2·C1 학습 표현 ${data.learning_items.length}개를 준비했어요`)
+      } else {
+        flash('전체 스크립트를 먼저 준비했어요')
+        if (data.analysis_status === 'pending') void runProgressiveAnalysis(data)
+      }
     } catch (error) {
-      setLoadError(error instanceof TypeError
+      const message = error instanceof TypeError
         ? '분석 서버에 연결할 수 없습니다. 백엔드가 실행 중인지 확인해 주세요.'
-        : error instanceof Error ? error.message : '영상 분석 중 오류가 발생했습니다.')
+        : error instanceof Error ? error.message : '영상 분석 중 오류가 발생했습니다.'
+      setLoadError(message)
+      const failedVideoId = extractYouTubeVideoId(value)
+      if (failedVideoId && message.includes('자막')) {
+        analysisControllerRef.current?.abort()
+        setEpisodeId(failedVideoId)
+        setEpisodeTitle('YouTube 영상')
+        setSourceName('YouTube · 사용할 수 있는 영어 자막 없음')
+        setDurationSec(0)
+        setTranscript([])
+        setLearningItems([])
+        setAnalysisStatus('error')
+        setAnalysisProgress({ completed: 0, total: 0 })
+        setLoaded(true)
+        navigateTo('dictation')
+      }
     } finally {
       setLoading(false)
     }
@@ -671,6 +820,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   const translationCache = useRef<Record<number, string>>({ ...translations })
   const duration = Math.max(playerDuration, durationSec, transcript.at(-1)?.end_sec || 0, 1)
   const currentIndex = useMemo(() => {
+    if (!transcript.length) return -1
     let active = 0
     transcript.forEach((line, index) => {
       if (currentTime >= line.timestamp_sec) active = index
@@ -790,7 +940,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }, [playerReady])
 
   useEffect(() => {
-    if (playing && autoFollow) lineRefs.current[currentIndex]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (playing && autoFollow && currentIndex >= 0) lineRefs.current[currentIndex]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [autoFollow, currentIndex, playing])
 
   function c1ItemsForBlock(block: TranscriptBlock) {
@@ -810,6 +960,13 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
     player.seekTo(seconds, true)
     setCurrentTime(seconds)
     if (autoplay && typeof player.playVideo === 'function') player.playVideo()
+  }
+
+  function playFromTranscript(event: MouseEvent<HTMLDivElement>, seconds: number) {
+    if (window.getSelection()?.toString().trim()) return
+    const target = event.target as HTMLElement
+    if (target.closest('button, input, a, .hint-wrap, .wordwise')) return
+    seekTo(seconds, true)
   }
 
   function handleSelection(event: PointerEvent<HTMLParagraphElement>, line: number, rawText: string) {
@@ -921,9 +1078,10 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
         <div><span>FULL TRANSCRIPT</span><h2>전체 스크립트</h2></div>
         <label className="follow-toggle"><span>자동으로 따라가기</span><input type="checkbox" checked={autoFollow} onChange={(event) => setAutoFollow(event.target.checked)} /><i aria-hidden="true" /><b>{autoFollow ? 'ON' : 'OFF'}</b></label>
       </div>
-      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 단어 분석 중… {analysisProgress.completed}/{analysisProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{currentIndex + 1} / {transcript.length}</b></div>
+      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{transcript.length ? (playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요') : '이 영상에는 동기화할 영어 자막이 없어요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 단어 분석 중… {analysisProgress.completed}/{analysisProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{Math.max(0, currentIndex + 1)} / {transcript.length}</b></div>
       <div className="transcript-body reading-body">
-        {transcript.map((line, index) => <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`}>
+        {!transcript.length && <div className="empty-state">YouTube에서 사용할 수 있는 영어 자막을 제공하지 않아 전체 스크립트를 만들 수 없습니다.<br /><small>영상은 위 플레이어에서 그대로 재생할 수 있어요.</small></div>}
+        {transcript.map((line, index) => <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`} onClick={(event) => playFromTranscript(event, line.timestamp_sec)}>
           <span className="timestamp">{line.timestamp_display}</span>
           <div className="script-copy"><p onPointerUp={(event) => handleSelection(event, index, line.text)}><InteractiveScriptText text={line.text} c1Items={c1ItemsForBlock(line)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event) => openWord(word, event, line.text)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading === index && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
         </div>)}
