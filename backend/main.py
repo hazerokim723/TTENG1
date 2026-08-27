@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Literal
@@ -36,6 +37,10 @@ TRANSCRIPT_CHUNK_CHARACTER_LIMIT = 28_000
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ANALYSIS_VERSION = "b2-c1-phrasal-v1"
 IS_VERCEL = bool(os.getenv("VERCEL"))
+SUPADATA_API_URL = os.getenv(
+    "SUPADATA_API_URL", "https://api.supadata.ai/v1"
+).rstrip("/")
+SUPADATA_POLL_TIMEOUT_SECONDS = 45
 CACHE_DIRECTORY = Path(
     os.getenv("TURTLE_CACHE_DIRECTORY")
     or (
@@ -50,6 +55,18 @@ WORD_CACHE_PATH = CACHE_DIRECTORY / f"{WORD_CACHE_VERSION}.json"
 
 class CaptionUnavailableError(Exception):
     """Raised when a transcript exists but contains no usable caption text."""
+
+
+class SupadataAuthenticationError(Exception):
+    """Raised when the configured Supadata key is missing permissions or invalid."""
+
+
+class SupadataRateLimitError(Exception):
+    """Raised when the Supadata plan has no credits or is being rate limited."""
+
+
+class SupadataServiceError(Exception):
+    """Raised when Supadata cannot complete a transcript request."""
 
 
 class AnalyzeEpisodeRequest(BaseModel):
@@ -217,7 +234,110 @@ def format_timestamp(seconds: float) -> str:
     )
 
 
-def fetch_caption_entries(video_id: str) -> list[tuple[float, str]]:
+def supadata_error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except (requests.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    detail = payload.get("message") or payload.get("error") or payload.get("detail")
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("code")
+    return str(detail or "").strip()
+
+
+def parse_supadata_entries(payload: dict) -> list[tuple[float, str]]:
+    """Convert Supadata millisecond offsets into the app's second-based format."""
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    content = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(content, list):
+        raise CaptionUnavailableError
+
+    entries: list[tuple[float, str]] = []
+    for segment in content:
+        if not isinstance(segment, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(segment.get("text") or "")).strip()
+        try:
+            timestamp_sec = max(0, float(segment.get("offset", 0)) / 1_000)
+        except (TypeError, ValueError):
+            continue
+        if text:
+            entries.append((timestamp_sec, text))
+
+    if not entries:
+        raise CaptionUnavailableError
+    return entries
+
+
+def request_supadata_json(
+    path: str, api_key: str, *, params: dict[str, str] | None = None
+) -> tuple[int, dict]:
+    try:
+        response = requests.get(
+            f"{SUPADATA_API_URL}{path}",
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            params=params,
+            timeout=(10, 35),
+        )
+    except requests.RequestException as error:
+        raise SupadataServiceError from error
+
+    detail = supadata_error_detail(response)
+    if response.status_code in {401, 403}:
+        raise SupadataAuthenticationError(detail)
+    if response.status_code in {402, 429}:
+        raise SupadataRateLimitError(detail)
+    if response.status_code in {400, 404, 422}:
+        raise CaptionUnavailableError(detail)
+    if response.status_code >= 500:
+        raise SupadataServiceError(detail)
+    try:
+        payload = response.json()
+    except (requests.JSONDecodeError, ValueError) as error:
+        raise SupadataServiceError from error
+    if not isinstance(payload, dict):
+        raise SupadataServiceError
+    return response.status_code, payload
+
+
+def fetch_caption_entries_from_supadata(
+    video_id: str, api_key: str
+) -> list[tuple[float, str]]:
+    """Fetch existing English captions without triggering paid AI transcription."""
+    status_code, payload = request_supadata_json(
+        "/transcript",
+        api_key,
+        params={
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "lang": "en",
+            "text": "false",
+            "mode": "native",
+        },
+    )
+    if status_code != 202 and "jobId" not in payload:
+        return parse_supadata_entries(payload)
+
+    job_id = str(payload.get("jobId") or "").strip()
+    if not job_id:
+        raise SupadataServiceError
+    deadline = time.monotonic() + SUPADATA_POLL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        _, job_payload = request_supadata_json(f"/transcript/{job_id}", api_key)
+        job_status = str(job_payload.get("status") or "").lower()
+        if job_status in {"completed", "complete", "succeeded", "success"}:
+            return parse_supadata_entries(job_payload)
+        if job_status in {"failed", "error", "cancelled", "canceled"}:
+            detail = str(job_payload.get("error") or job_payload.get("message") or "")
+            if "transcript" in detail.lower() or "caption" in detail.lower():
+                raise CaptionUnavailableError(detail)
+            raise SupadataServiceError(detail)
+        time.sleep(1)
+    raise SupadataServiceError("Supadata transcript job timed out")
+
+
+def fetch_caption_entries_direct(video_id: str) -> list[tuple[float, str]]:
     webshare_username = os.getenv("WEBSHARE_PROXY_USERNAME", "").strip()
     webshare_password = os.getenv("WEBSHARE_PROXY_PASSWORD", "").strip()
     generic_proxy_url = os.getenv("YOUTUBE_PROXY_URL", "").strip()
@@ -251,6 +371,14 @@ def fetch_caption_entries(video_id: str) -> list[tuple[float, str]]:
     if not entries:
         raise CaptionUnavailableError
     return entries
+
+
+def fetch_caption_entries(video_id: str) -> list[tuple[float, str]]:
+    """Use Supadata when configured, retaining direct extraction for local fallback."""
+    supadata_api_key = os.getenv("SUPADATA_API_KEY", "").strip()
+    if supadata_api_key:
+        return fetch_caption_entries_from_supadata(video_id, supadata_api_key)
+    return fetch_caption_entries_direct(video_id)
 
 
 def fetch_video_metadata(video_id: str) -> tuple[str, str]:
@@ -838,12 +966,27 @@ async def analyze_episode(
             status_code=400,
             detail="이 영상에서 사용 가능한 영어 자막을 찾을 수 없습니다.",
         ) from error
+    except SupadataAuthenticationError as error:
+        raise HTTPException(
+            status_code=401,
+            detail="Supadata API 키가 유효하지 않습니다. Vercel 환경변수를 확인해 주세요.",
+        ) from error
+    except SupadataRateLimitError as error:
+        raise HTTPException(
+            status_code=429,
+            detail="Supadata 무료 크레딧 또는 요청 한도를 초과했습니다.",
+        ) from error
+    except SupadataServiceError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Supadata 자막 서비스에 일시적으로 연결할 수 없습니다.",
+        ) from error
     except (RequestBlocked, IpBlocked) as error:
         raise HTTPException(
             status_code=503,
             detail=(
                 "YouTube가 배포 서버의 자막 요청을 차단했습니다. "
-                "Vercel에 주거용 프록시 환경변수를 설정해 주세요."
+                "Vercel에 SUPADATA_API_KEY를 설정해 주세요."
             ),
         ) from error
     except CouldNotRetrieveTranscript as error:
