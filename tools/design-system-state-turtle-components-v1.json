@@ -1,0 +1,35 @@
+{
+  "fileKey": "ixlhT0d8qJiHORaEdejGBJ",
+  "font": "Noto Sans KR",
+  "collections": {
+    "primitives": { "id": "VariableCollectionId:63:2", "mode": "63:0" },
+    "color": { "id": "VariableCollectionId:63:3", "light": "63:1", "dark": "63:2" },
+    "spacing": { "id": "VariableCollectionId:63:4", "mode": "63:3" },
+    "radius": { "id": "VariableCollectionId:63:5", "mode": "63:4" }
+  },
+  "variables": {
+    "primitiveColors": 23,
+    "semanticColors": 12,
+    "spacing": 6,
+    "radius": 5
+  },
+  "styles": {
+    "text": 7,
+    "effects": 2
+  },
+  "pages": {
+    "cover": "64:57",
+    "gettingStarted": "64:58",
+    "foundations": "64:59",
+    "button": "64:61",
+    "navigationItem": "64:62",
+    "scriptRow": "64:63",
+    "darkModeDemo": "64:65"
+  },
+  "components": {
+    "button": { "id": "65:38", "variants": 18 },
+    "navigationItem": { "id": "66:30", "variants": 4 },
+    "scriptRow": { "id": "66:52", "variants": 6 }
+  },
+  "demo": { "darkModeFrame": "66:54" }
+}
