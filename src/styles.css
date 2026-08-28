@@ -1029,6 +1029,8 @@ footer {
 
 .dictation-good { position: absolute; z-index: 5; left: 50%; top: -5px; color: #43825c; font-size: 11px; font-weight: 800; pointer-events: none; animation: dictation-good 1.35s ease-out both; }
 @keyframes dictation-good { 0% { opacity: 0; transform: translate(-50%, -45%) scale(.9); } 18% { opacity: 1; transform: translate(-50%, -100%) scale(1); } 72% { opacity: 1; transform: translate(-50%, -145%) scale(1); } 100% { opacity: 0; transform: translate(-50%, -190%) scale(.98); } }
+.dictation-sentence-complete { display: inline-grid; place-items: center; width: 18px; height: 18px; margin-left: 7px; color: #43825c; background: #e8f3eb; border-radius: 50%; font-size: 11px; font-weight: 800; vertical-align: 2px; animation: sentence-complete-pop .2s ease-out both; }
+@keyframes sentence-complete-pop { from { opacity: 0; transform: scale(.75); } to { opacity: 1; transform: scale(1); } }
 
 .c1-definition {
   display: inline-flex;

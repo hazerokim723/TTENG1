@@ -41,7 +41,7 @@ OPENAI_ANALYSIS_MODEL = os.getenv(
 OPENAI_TRANSLATION_MODEL = os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-5-mini")
 OPENAI_LOOKUP_MODEL = os.getenv("OPENAI_LOOKUP_MODEL", "gpt-5-mini")
 OPENAI_MODEL = OPENAI_ANALYSIS_MODEL
-ANALYSIS_VERSION = "korean-expression-ranges-v2"
+ANALYSIS_VERSION = "korean-expression-ranges-v3"
 TRANSLATION_VERSION = "ko-editorial-v1"
 IS_VERCEL = bool(os.getenv("VERCEL"))
 SUPADATA_API_URL = os.getenv(
@@ -639,7 +639,10 @@ def analyze_chunk(
         if not response.output_text:
             raise RuntimeError("OpenAI가 빈 응답을 반환했습니다.")
         parsed = LearningItemsPayload.model_validate_json(response.output_text)
-    return normalize_items(parsed.learning_items)
+    return normalize_items(
+        parsed.learning_items,
+        rendered_sentences=rendered_sentences_from_chunk(transcript_chunk),
+    )
 
 
 def cache_path(video_id: str) -> Path:
@@ -989,17 +992,54 @@ def translate_sentences(
     return [unique[index] for index in sorted(unique)]
 
 
-def normalize_items(items: Iterable[LearningItem]) -> list[LearningItem]:
+def rendered_sentences_from_chunk(transcript_chunk: str) -> dict[int, str]:
+    rendered: dict[int, str] = {}
+    pattern = re.compile(
+        r"^\[sentence_index=(\d+)]\s+\[[0-9.]+s]\s+(.*)$"
+    )
+    for line in transcript_chunk.splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            rendered[int(match.group(1))] = match.group(2).strip()
+    return rendered
+
+
+def mask_expression_in_sentence(sentence: str, start: int, end: int) -> str:
+    expression = sentence[start:end]
+    masked = re.sub(
+        r"[A-Za-z]+",
+        lambda match: (
+            match.group(0)
+            if len(match.group(0)) <= 2
+            else f"{match.group(0)[:2]}{'_' * (len(match.group(0)) - 2)}"
+        ),
+        expression,
+    )
+    return f"{sentence[:start]}{masked}{sentence[end:]}"
+
+
+def normalize_items(
+    items: Iterable[LearningItem],
+    rendered_sentences: dict[int, str] | None = None,
+) -> list[LearningItem]:
     """Sort results and remove likely duplicates created at chunk boundaries."""
     unique: dict[tuple[int, str], LearningItem] = {}
     for item in items:
         item.expression = (item.expression or item.target_word).strip()
         item.target_word = item.expression
+        if not item.expression:
+            continue
         item.anchor_words = item.anchor_words or re.findall(
             r"[A-Za-z][A-Za-z'’-]*", item.expression
         )
         item.is_phrasal_verb = item.expression_type == "phrasal_verb"
-        sentence = item.full_sentence_original
+        if rendered_sentences is not None:
+            sentence = rendered_sentences.get(item.sentence_index)
+            if sentence is None:
+                continue
+            item.full_sentence_original = sentence
+        else:
+            sentence = item.full_sentence_original
         if sentence:
             expected = sentence[item.start_char : item.end_char]
             if (
@@ -1014,6 +1054,13 @@ def normalize_items(items: Iterable[LearningItem]) -> list[LearningItem]:
                 else:
                     item.start_char = -1
                     item.end_char = -1
+            if item.start_char < 0:
+                continue
+            item.masked_sentence = (
+                mask_expression_in_sentence(sentence, item.start_char, item.end_char)
+                if item.is_dictation_target
+                else sentence
+            )
         item.timestamp_display = format_timestamp(item.timestamp_sec)
         key = (item.sentence_index, item.expression.casefold().strip())
         unique.setdefault(key, item)

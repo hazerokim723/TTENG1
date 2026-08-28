@@ -9,7 +9,9 @@ from backend.main import (
     TranslationItem,
     app,
     fetch_caption_entries_from_supadata,
+    mask_expression_in_sentence,
     normalize_items,
+    rendered_sentences_from_chunk,
 )
 
 
@@ -42,6 +44,55 @@ class TurtleEnglishApiTests(unittest.TestCase):
         self.assertEqual(normalized.end_char, normalized.start_char + len("come up with"))
         self.assertEqual(normalized.anchor_words, ["come", "up", "with"])
         self.assertTrue(normalized.is_phrasal_verb)
+
+    def test_ai_sentence_is_replaced_with_exact_rendered_sentence(self) -> None:
+        rendered = "We need to come up with a better plan."
+        item = LearningItem(
+            timestamp_sec=8.0,
+            timestamp_display="",
+            full_sentence_original="We should come up with a better plan.",
+            masked_sentence="",
+            target_word="come up with",
+            expression="come up with",
+            expression_type="phrasal_verb",
+            word_type="phrasal verb",
+            definition_kr="생각해 내다",
+            hint_for_tap="",
+            sentence_index=7,
+            start_char=10,
+            end_char=22,
+            is_dictation_target=True,
+        )
+
+        normalized = normalize_items([item], rendered_sentences={7: rendered})
+
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0].full_sentence_original, rendered)
+        self.assertEqual(rendered[normalized[0].start_char:normalized[0].end_char], "come up with")
+        self.assertEqual(normalized[0].target_word, normalized[0].expression)
+        self.assertIn("co__ up wi__", normalized[0].masked_sentence)
+
+    def test_expression_missing_from_rendered_sentence_is_rejected(self) -> None:
+        item = LearningItem(
+            timestamp_sec=8.0,
+            timestamp_display="",
+            full_sentence_original="AI invented this sentence.",
+            masked_sentence="",
+            target_word="make up for",
+            expression="make up for",
+            expression_type="phrasal_verb",
+            word_type="phrasal verb",
+            definition_kr="보상하다",
+            hint_for_tap="",
+            sentence_index=2,
+        )
+
+        self.assertEqual(normalize_items([item], rendered_sentences={2: "The actual sentence has no such phrase."}), [])
+
+    def test_rendered_sentence_parser_preserves_screen_text(self) -> None:
+        chunk = "[sentence_index=4] [12.500s] This is the exact on-screen sentence.\n[sentence_index=5] [14.000s] Next sentence."
+        self.assertEqual(rendered_sentences_from_chunk(chunk)[4], "This is the exact on-screen sentence.")
+        self.assertEqual(mask_expression_in_sentence("come up with", 0, 12), "co__ up wi__")
 
     def test_translation_cache_works_without_browser_supabase_credentials(self) -> None:
         with patch.dict(os.environ, {"SUPABASE_URL": "", "SUPABASE_SERVICE_ROLE_KEY": ""}):

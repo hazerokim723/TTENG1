@@ -179,7 +179,7 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, ''
 const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v2'
 const SAVED_WORD_DETAILS_STORAGE_KEY = 'turtle-saved-word-details-v1'
 const AI_CONNECTION_STORAGE_KEY = 'turtle-openai-connection-v1'
-const ANALYSIS_VERSION = 'korean-expression-ranges-v2'
+const ANALYSIS_VERSION = 'korean-expression-ranges-v3'
 const TRANSLATION_VERSION = 'ko-editorial-v1'
 const EPISODE_CACHE_PREFIX = 'turtle-episode-analysis'
 const PREFETCH_STOP_WORDS = new Set([
@@ -999,6 +999,7 @@ function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved
 
 function InteractiveScriptText({ text, sentenceIndex, items, highlights, completedWords, onWordClick, onSaveWord, onCompleteWord }: { text: string; sentenceIndex: number; items: LearningItem[]; highlights: Highlight[]; completedWords: string[]; onWordClick: (word: string, event: MouseEvent<HTMLElement>, charOffset: number) => void; onSaveWord: (word: string, details?: WordDefinition) => void; onCompleteWord: (word: string) => void }) {
   const [focusTokenId, setFocusTokenId] = useState('')
+  const [sentenceComplete, setSentenceComplete] = useState(false)
   const resolvedTokenIds = useRef(new Set<string>())
   const targets = useMemo(() => items
     .filter((item) => item.is_dictation_target !== false)
@@ -1014,13 +1015,16 @@ function InteractiveScriptText({ text, sentenceIndex, items, highlights, complet
   useEffect(() => {
     resolvedTokenIds.current = new Set()
     setFocusTokenId('')
+    setSentenceComplete(false)
   }, [sentenceIndex, text])
 
   function handleResolved(tokenId: string, typed: boolean) {
     resolvedTokenIds.current.add(tokenId)
     if (!typed) return
     const currentPosition = targets.findIndex((target) => target.id === tokenId)
-    const next = targets.slice(currentPosition + 1).find((target) => !resolvedTokenIds.current.has(target.id) && !completedWords.includes(target.expression.toLocaleLowerCase()))
+    const incomplete = (target: typeof targets[number]) => !resolvedTokenIds.current.has(target.id) && !completedWords.includes(target.expression.toLocaleLowerCase())
+    const next = targets.slice(currentPosition + 1).find(incomplete) || targets.find(incomplete)
+    if (!next) setSentenceComplete(true)
     window.setTimeout(() => setFocusTokenId(next?.id || ''), 200)
   }
 
@@ -1068,7 +1072,7 @@ function InteractiveScriptText({ text, sentenceIndex, items, highlights, complet
     cursor = Math.max(cursor, mark.end)
   })
   if (cursor < text.length) nodes.push(...renderSegment(text.slice(cursor), cursor, `plain-${cursor}`))
-  return <>{nodes}</>
+  return <>{nodes}{sentenceComplete && <span className="dictation-sentence-complete" role="status" aria-label="문장 받아쓰기 완료">✓</span>}</>
 }
 
 type DictationProps = {
