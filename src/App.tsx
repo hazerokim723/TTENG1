@@ -28,11 +28,56 @@ type LearningItem = {
   hint_for_tap: string
   level?: 'B2' | 'C1'
   is_phrasal_verb?: boolean
+  sentence_index?: number
+  expression?: string
+  expression_type?: 'vocabulary' | 'phrasal_verb' | 'idiom' | 'collocation'
+  anchor_words?: string[]
+  literal_meaning_kr?: string
+  learner_note_kr?: string
+  grammar_pattern?: string
+  register?: string
+  example_en?: string
+  example_kr?: string
+  start_char?: number
+  end_char?: number
+  is_dictation_target?: boolean
 }
 type TranscriptBlock = { timestamp_sec: number; end_sec: number; timestamp_display: string; text: string }
-type WordDefinition = { word: string; word_type: string; definition_kr: string }
+type WordDefinition = {
+  word: string
+  word_type: string
+  definition_kr: string
+  expression_type?: 'vocabulary' | 'phrasal_verb' | 'idiom' | 'collocation'
+  literal_meaning_kr?: string
+  learner_note_kr?: string
+  grammar_pattern?: string
+  register?: string
+  example_en?: string
+  example_kr?: string
+}
 type SavedWordDetails = Record<string, WordDefinition>
-type TranslationResponse = { translation_kr: string }
+type LearningProgressRecord = {
+  video_id: string
+  video_title: string | null
+  channel_name: string | null
+  duration_sec: number
+  last_position_sec: number
+  progress_percent: number
+  status: 'started' | 'in_progress' | 'completed'
+  started_at: string
+  last_studied_at: string
+  completed_at: string | null
+}
+type TranslationItem = { sentence_index: number; translation_kr: string }
+type TranslationCacheResponse = {
+  video_id: string
+  transcript_hash: string
+  translation_version: string
+  translations: TranslationItem[]
+  completed: number
+  total: number
+  persistent: boolean
+}
 type OpenAIConnectionResponse = { status: 'connected'; model: string }
 type ApiErrorResponse = { detail?: string }
 type AnalyzeResponse = {
@@ -131,10 +176,11 @@ const sampleTranscript: TranscriptBlock[] = [
 ]
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
-const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v1'
+const WORD_CACHE_STORAGE_KEY = 'turtle-word-definitions-v2'
 const SAVED_WORD_DETAILS_STORAGE_KEY = 'turtle-saved-word-details-v1'
 const AI_CONNECTION_STORAGE_KEY = 'turtle-openai-connection-v1'
-const ANALYSIS_VERSION = 'b2-c1-phrasal-v1'
+const ANALYSIS_VERSION = 'korean-expression-ranges-v2'
+const TRANSLATION_VERSION = 'ko-editorial-v1'
 const EPISODE_CACHE_PREFIX = 'turtle-episode-analysis'
 const PREFETCH_STOP_WORDS = new Set([
   'about', 'after', 'again', 'also', 'another', 'because', 'before', 'being', 'between', 'could', 'does', 'from', 'have', 'into', 'just', 'more', 'most', 'other', 'over', 'same', 'some', 'such', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'with', 'would', 'your',
@@ -159,6 +205,26 @@ function storeWordDefinitions(cache: Map<string, WordDefinition>) {
 
 function normalizeWordKey(word: string) {
   return word.trim().toLocaleLowerCase().slice(0, 120)
+}
+
+function fastTextHash(text: string) {
+  let hash = 2166136261
+  for (const character of text.replace(/\s+/g, ' ').trim().toLocaleLowerCase()) {
+    hash ^= character.charCodeAt(0)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+async function transcriptDigest(blocks: TranscriptBlock[]) {
+  const normalized = blocks.map((block) => `${block.timestamp_sec.toFixed(3)}|${block.text.replace(/\s+/g, ' ').trim()}`).join('\n')
+  if (!globalThis.crypto?.subtle) return fastTextHash(normalized)
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalized))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function contextualWordKey(word: string, sentence: string) {
+  return `${normalizeWordKey(word)}:${fastTextHash(sentence)}`
 }
 
 function savedSentenceKey(videoId: string | undefined, sentence: Pick<SavedSentence, 'time' | 'text' | 'timestampSec'>) {
@@ -239,8 +305,8 @@ function chunkTranscriptBlocks(blocks: TranscriptBlock[], characterLimit = 24_00
   const chunks: string[] = []
   let current: string[] = []
   let size = 0
-  for (const block of blocks) {
-    const line = `[${block.timestamp_sec.toFixed(3)}s] ${block.text}`
+  for (const [sentenceIndex, block] of blocks.entries()) {
+    const line = `[sentence_index=${sentenceIndex}] [${block.timestamp_sec.toFixed(3)}s] ${block.text}`
     if (current.length && size + line.length + 1 > characterLimit) {
       chunks.push(current.join('\n'))
       current = []
@@ -325,9 +391,11 @@ function App() {
   const [toast, setToast] = useState('')
   const [authUser, setAuthUser] = useState<User | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
+  const [learningProgressByVideo, setLearningProgressByVideo] = useState<Record<string, LearningProgressRecord>>({})
   const [aiConnection, setAiConnection] = useState<'unknown' | 'checking' | 'connected' | 'error'>(() => loadStoredAIConnection() ? 'connected' : 'unknown')
   const [aiConnectionMessage, setAiConnectionMessage] = useState('')
   const analysisControllerRef = useRef<AbortController | null>(null)
+  const previousAuthUserIdRef = useRef<string | null>(null)
 
   function navigateTo(nextTab: Tab) {
     setTab(nextTab)
@@ -377,17 +445,18 @@ function App() {
     void Promise.all([
       supabase.from('saved_words').select('word, word_key, word_type, definition_kr').eq('user_id', authUser.id).order('created_at', { ascending: true }),
       supabase.from('saved_sentences').select('id, sentence_key, sentence_text, video_id, video_title, channel_name, timestamp_sec, timestamp_display, created_at').eq('user_id', authUser.id).order('created_at', { ascending: false }),
-    ]).then(([wordsResult, sentencesResult]) => {
+      supabase.from('learning_progress').select('video_id, video_title, channel_name, duration_sec, last_position_sec, progress_percent, status, started_at, last_studied_at, completed_at').eq('user_id', authUser.id).order('last_studied_at', { ascending: false }),
+    ]).then(([wordsResult, sentencesResult, progressResult]) => {
       if (!active) return
-      if (wordsResult.error || sentencesResult.error) {
+      if (wordsResult.error || sentencesResult.error || progressResult.error) {
         flash('계정 저장 내용을 불러오지 못했어요. 잠시 후 다시 시도해 주세요')
         return
       }
 
       const remoteWords = wordsResult.data || []
-      setBag((current) => Array.from(new Set([...current.map(normalizeWordKey), ...remoteWords.map((row) => row.word_key)])))
-      setSavedWordDetails((current) => {
-        const next = { ...current }
+      setBag(Array.from(new Set(remoteWords.map((row) => row.word_key))))
+      setSavedWordDetails(() => {
+        const next: SavedWordDetails = {}
         remoteWords.forEach((row) => {
           next[row.word_key] = {
             word: row.word,
@@ -409,20 +478,59 @@ function App() {
         channelName: row.channel_name || undefined,
         timestampSec: row.timestamp_sec || 0,
       }))
-      setSaved((current) => {
-        const merged = new Map<string, SavedSentence>()
-        current.forEach((sentence) => merged.set(savedSentenceKey(sentence.videoId, sentence), sentence))
-        remoteSentences.forEach((sentence) => merged.set(savedSentenceKey(sentence.videoId, sentence), sentence))
-        return Array.from(merged.values()).sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''))
-      })
+      setSaved(remoteSentences)
+      setLearningProgressByVideo(Object.fromEntries((progressResult.data || []).map((row) => [row.video_id, row as LearningProgressRecord])))
     })
 
     return () => { active = false }
   }, [authUser])
 
+  useEffect(() => {
+    if (authLoading) return
+    const previousUserId = previousAuthUserIdRef.current
+    const nextUserId = authUser?.id || null
+    if (previousUserId && !nextUserId) {
+      setBag([])
+      setSavedWordDetails({})
+      setSaved([])
+      setLearningProgressByVideo({})
+    }
+    previousAuthUserIdRef.current = nextUserId
+  }, [authLoading, authUser])
+
   useEffect(() => () => analysisControllerRef.current?.abort(), [])
 
   const episodeProgress = useMemo(() => Math.min(100, Math.round((progress / 100) * 100)), [progress])
+  const dictationItems = useMemo(() => learningItems.filter((item) => item.is_dictation_target !== false), [learningItems])
+
+  function persistLearningProgress(videoId: string, title: string, channel: string, duration: number, position = 0) {
+    if (!supabase || !authUser || !videoId) return
+    const safeDuration = Math.max(0, duration || 0)
+    const safePosition = Math.max(0, Math.min(position || 0, safeDuration || position || 0))
+    const progressPercent = safeDuration > 0 ? Math.min(100, Number(((safePosition / safeDuration) * 100).toFixed(2))) : 0
+    const status: LearningProgressRecord['status'] = progressPercent >= 95 ? 'completed' : safePosition > 0 ? 'in_progress' : 'started'
+    const now = new Date().toISOString()
+    const existing = learningProgressByVideo[videoId]
+    const record: LearningProgressRecord = {
+      video_id: videoId,
+      video_title: title || null,
+      channel_name: channel || null,
+      duration_sec: safeDuration,
+      last_position_sec: safePosition,
+      progress_percent: progressPercent,
+      status,
+      started_at: existing?.started_at || now,
+      last_studied_at: now,
+      completed_at: status === 'completed' ? (existing?.completed_at || now) : null,
+    }
+    setLearningProgressByVideo((current) => ({ ...current, [videoId]: record }))
+    void supabase.from('learning_progress').upsert({
+      user_id: authUser.id,
+      ...record,
+    }, { onConflict: 'user_id,video_id' }).then(({ error }) => {
+      if (error) flash('학습 기록을 계정에 저장하지 못했어요')
+    })
+  }
 
   async function checkOpenAIConnection() {
     setAiConnection('checking')
@@ -519,6 +627,7 @@ function App() {
         setAnalysisProgress({ completed: 1, total: 1 })
         setLoaded(true)
         navigateTo('dictation')
+        persistLearningProgress(browserCache.episode_id, browserCache.title, browserCache.source_name, browserCache.duration_sec, learningProgressByVideo[browserCache.episode_id]?.last_position_sec || 0)
         flash('저장된 분석 결과를 바로 불러왔어요')
         return
       }
@@ -547,6 +656,7 @@ function App() {
       setLoading(false)
       setLoaded(true)
       navigateTo('dictation')
+      persistLearningProgress(data.episode_id, data.title, data.source_name, data.duration_sec, learningProgressByVideo[data.episode_id]?.last_position_sec || 0)
       if (data.analysis_status === 'complete') {
         storeEpisodeAnalysisCache(data, data.learning_items)
         flash(`B2·C1 학습 표현 ${data.learning_items.length}개를 준비했어요`)
@@ -670,7 +780,7 @@ function App() {
   }
 
   function submitQuiz() {
-    const item = learningItems[quizIndex]
+    const item = dictationItems[quizIndex]
     if (!item) return
     if (answer.trim().toLowerCase() === item.target_word.toLowerCase()) {
       setQuizState('correct')
@@ -718,8 +828,8 @@ function App() {
         </section>
 
         {loaded && <section className="workspace">
-          {tab === 'dictation' && <Dictation episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} />}
-          {tab === 'quiz' && <Quiz item={learningItems[quizIndex]} index={quizIndex} total={learningItems.length} answer={answer} setAnswer={setAnswer} state={quizState} submit={submitQuiz} next={() => { setAnswer(''); setQuizState('idle'); setQuizIndex((quizIndex + 1) % learningItems.length) }} />}
+          {tab === 'dictation' && <Dictation episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} initialPositionSec={learningProgressByVideo[episodeId]?.last_position_sec || 0} onProgress={(position, duration) => persistLearningProgress(episodeId, episodeTitle, sourceName, duration, position)} />}
+          {tab === 'quiz' && <Quiz item={dictationItems[quizIndex]} index={quizIndex} total={dictationItems.length} answer={answer} setAnswer={setAnswer} state={quizState} submit={submitQuiz} next={() => { setAnswer(''); setQuizState('idle'); setQuizIndex((quizIndex + 1) % Math.max(1, dictationItems.length)) }} />}
           {tab === 'bag' && <Bag words={bag} items={learningItems} details={savedWordDetails} practice={() => navigateTo('quiz')} />}
           {tab === 'vault' && <Vault sentences={saved} remove={removeSavedSentence} />}
           {tab === 'journey' && <Journey progress={progress} />}
@@ -817,7 +927,7 @@ function maskLearningTarget(target: string) {
   })
 }
 
-function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (word: string, details?: WordDefinition) => void; onComplete: (word: string) => void }) {
+function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved }: { item: LearningItem; tokenId: string; focusRequested: boolean; onSave: (word: string, details?: WordDefinition) => void; onComplete: (word: string) => void; onResolved: (tokenId: string, typed: boolean) => void }) {
   const phrase = item.target_word.trim()
   const prefix = phrase.slice(0, 2)
   const [revealed, setRevealed] = useState(false)
@@ -831,12 +941,18 @@ function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (wo
   const masked = maskLearningTarget(phrase)
 
   useEffect(() => () => { window.clearTimeout(clickTimer.current); window.clearTimeout(goodTimer.current) }, [])
-  useEffect(() => { if (editing) inputRef.current?.focus() }, [editing])
+  useEffect(() => { if (editing) inputRef.current?.focus({ preventScroll: true }) }, [editing])
+  useEffect(() => {
+    if (!focusRequested || revealed) return
+    setEditing(true)
+    window.requestAnimationFrame(() => inputRef.current?.focus({ preventScroll: true }))
+  }, [focusRequested, revealed])
 
   function reveal() {
     window.clearTimeout(clickTimer.current)
     setRevealed(true)
     setEditing(false)
+    onResolved(tokenId, false)
     onSave(phrase, { word: phrase, word_type: item.word_type, definition_kr: item.definition_kr })
   }
 
@@ -848,6 +964,7 @@ function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (wo
       setRevealed(true)
       setEditing(false)
       setShowGood(true)
+      onResolved(tokenId, true)
       window.clearTimeout(goodTimer.current)
       goodTimer.current = window.setTimeout(() => { setShowGood(false); onComplete(phrase) }, 1400)
       onSave(phrase, { word: phrase, word_type: item.word_type, definition_kr: item.definition_kr })
@@ -880,33 +997,59 @@ function C1Token({ item, onSave, onComplete }: { item: LearningItem; onSave: (wo
   </span>
 }
 
-function InteractiveScriptText({ text, c1Items, highlights, completedWords, onWordClick, onSaveWord, onCompleteWord }: { text: string; c1Items: LearningItem[]; highlights: Highlight[]; completedWords: string[]; onWordClick: (word: string, event: MouseEvent<HTMLElement>) => void; onSaveWord: (word: string, details?: WordDefinition) => void; onCompleteWord: (word: string) => void }) {
+function InteractiveScriptText({ text, sentenceIndex, items, highlights, completedWords, onWordClick, onSaveWord, onCompleteWord }: { text: string; sentenceIndex: number; items: LearningItem[]; highlights: Highlight[]; completedWords: string[]; onWordClick: (word: string, event: MouseEvent<HTMLElement>, charOffset: number) => void; onSaveWord: (word: string, details?: WordDefinition) => void; onCompleteWord: (word: string) => void }) {
+  const [focusTokenId, setFocusTokenId] = useState('')
+  const resolvedTokenIds = useRef(new Set<string>())
+  const targets = useMemo(() => items
+    .filter((item) => item.is_dictation_target !== false)
+    .map((item) => {
+      const expression = (item.expression || item.target_word).trim()
+      const declaredStart = item.start_char ?? -1
+      const start = declaredStart >= 0 ? declaredStart : text.toLocaleLowerCase().indexOf(expression.toLocaleLowerCase())
+      return { item, expression, start, id: `${sentenceIndex}:${start}:${expression.toLocaleLowerCase()}` }
+    })
+    .filter((target) => target.start >= 0)
+    .sort((a, b) => a.start - b.start || b.expression.length - a.expression.length), [items, sentenceIndex, text])
+
+  useEffect(() => {
+    resolvedTokenIds.current = new Set()
+    setFocusTokenId('')
+  }, [sentenceIndex, text])
+
+  function handleResolved(tokenId: string, typed: boolean) {
+    resolvedTokenIds.current.add(tokenId)
+    if (!typed) return
+    const currentPosition = targets.findIndex((target) => target.id === tokenId)
+    const next = targets.slice(currentPosition + 1).find((target) => !resolvedTokenIds.current.has(target.id) && !completedWords.includes(target.expression.toLocaleLowerCase()))
+    window.setTimeout(() => setFocusTokenId(next?.id || ''), 200)
+  }
+
   const renderSegment = (value: string, offset: number, key: string) => {
     const nodes: ReactNode[] = []
-    const targets = [...c1Items].sort((a, b) => b.target_word.length - a.target_word.length)
     let cursor = 0
     while (cursor < value.length) {
       const remaining = value.slice(cursor)
-      const learningItem = targets.find((item) => {
-        const target = item.target_word.trim()
-        if (!remaining.toLocaleLowerCase().startsWith(target.toLocaleLowerCase())) return false
+      const absoluteOffset = offset + cursor
+      const learningTarget = targets.find((target) => {
+        if (target.start !== absoluteOffset) return false
+        if (!remaining.toLocaleLowerCase().startsWith(target.expression.toLocaleLowerCase())) return false
         const before = cursor === 0 ? '' : value[cursor - 1]
-        const after = value[cursor + target.length] || ''
+        const after = value[cursor + target.expression.length] || ''
         return !/[A-Za-z]/.test(before) && !/[A-Za-z]/.test(after)
       })
-      if (learningItem) {
-        const target = learningItem.target_word.trim()
+      if (learningTarget) {
+        const { item: learningItem, expression: target, id } = learningTarget
         if (completedWords.includes(target.toLocaleLowerCase())) {
-          nodes.push(<span key={`${key}-learned-${offset + cursor}`} className="script-word learned-word" onClick={(event) => onWordClick(target, event)}>{target}</span>)
+          nodes.push(<span key={`${key}-learned-${absoluteOffset}`} className="script-word learned-word" onClick={(event) => onWordClick(target, event, absoluteOffset)}>{target}</span>)
         } else {
-          nodes.push(<C1Token key={`${key}-target-${offset + cursor}`} item={learningItem} onSave={onSaveWord} onComplete={onCompleteWord} />)
+          nodes.push(<C1Token key={`${key}-target-${absoluteOffset}`} item={learningItem} tokenId={id} focusRequested={focusTokenId === id} onSave={onSaveWord} onComplete={onCompleteWord} onResolved={handleResolved} />)
         }
-        cursor += learningItem.target_word.trim().length
+        cursor += target.length
         continue
       }
       const word = remaining.match(/^[A-Za-z][A-Za-z'’-]*/)?.[0]
       if (word) {
-        nodes.push(<span key={`${key}-word-${offset + cursor}`} className="script-word" onClick={(event) => onWordClick(word, event)}>{word}</span>)
+        nodes.push(<span key={`${key}-word-${absoluteOffset}`} className="script-word" onClick={(event) => onWordClick(word, event, absoluteOffset)}>{word}</span>)
         cursor += word.length
         continue
       }
@@ -948,9 +1091,11 @@ type DictationProps = {
   episodeProgress: number
   analysisStatus: AnalysisStatus
   analysisProgress: { completed: number; total: number }
+  initialPositionSec: number
+  onProgress: (position: number, duration: number) => void
 }
 
-function Dictation({ episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress }: DictationProps) {
+function Dictation({ episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress, initialPositionSec, onProgress }: DictationProps) {
   const [palette, setPalette] = useState<null | { line: number; start: number; end: number; text: string; x: number; y: number; placement: 'above' | 'below' }>(null)
   const [autoFollow, setAutoFollow] = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
@@ -958,13 +1103,26 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   const [playerReady, setPlayerReady] = useState(false)
   const [videoCollapsed, setVideoCollapsed] = useState(false)
   const [wordPopover, setWordPopover] = useState<null | { wordKey: string; x: number; y: number; loading: boolean; saved: boolean; data: WordDefinition; error?: string }>(null)
-  const [translations, setTranslations] = useState<Record<number, string>>(() => JSON.parse(localStorage.getItem(`turtle-translations-${episodeId}`) || '{}'))
-  const [translationLoading, setTranslationLoading] = useState<number | null>(null)
+  const [translations, setTranslations] = useState<Record<number, string>>({})
+  const [expandedTranslations, setExpandedTranslations] = useState<Set<number>>(new Set())
+  const [translationLoading, setTranslationLoading] = useState<Set<number>>(new Set())
+  const [translationHash, setTranslationHash] = useState('')
+  const [translationProgress, setTranslationProgress] = useState({ completed: 0, total: transcript.length, persistent: false })
+  const [visibleLineIndex, setVisibleLineIndex] = useState(0)
+  const visibleLineIndexRef = useRef(0)
   const lineRefs = useRef<Array<HTMLDivElement | null>>([])
+  const readingBodyRef = useRef<HTMLDivElement | null>(null)
   const playerHostRef = useRef<HTMLDivElement | null>(null)
   const playerRef = useRef<YouTubePlayerInstance | null>(null)
   const definitionCache = useRef(loadStoredWordDefinitions())
-  const translationCache = useRef<Record<number, string>>({ ...translations })
+  const translationCache = useRef<Record<number, string>>({})
+  const translationControllerRef = useRef<AbortController | null>(null)
+  const translationSlotsRef = useRef<{ active: number; waiters: Array<() => void> }>({ active: 0, waiters: [] })
+  const dragGuardUntilRef = useRef(0)
+  const pointerStartRef = useRef({ x: 0, y: 0 })
+  const onProgressRef = useRef(onProgress)
+  const lastProgressSyncRef = useRef({ episodeId: '', syncedAt: 0, position: -1 })
+  const restoredEpisodeRef = useRef('')
   const duration = Math.max(playerDuration, durationSec, transcript.at(-1)?.end_sec || 0, 1)
   const currentIndex = useMemo(() => {
     if (!transcript.length) return -1
@@ -975,15 +1133,25 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
     return active
   }, [currentTime, transcript])
 
+  useEffect(() => { onProgressRef.current = onProgress }, [onProgress])
+
   useEffect(() => {
     let changed = false
     items.forEach((item) => {
-      const key = item.target_word.toLocaleLowerCase()
+      const sentence = item.full_sentence_original || ''
+      const key = contextualWordKey(item.expression || item.target_word, sentence)
       if (!definitionCache.current.has(key)) {
         definitionCache.current.set(key, {
-          word: item.target_word,
+          word: item.expression || item.target_word,
           word_type: `${item.level || 'C1'} · ${item.word_type}`,
           definition_kr: item.definition_kr,
+          expression_type: item.expression_type,
+          literal_meaning_kr: item.literal_meaning_kr,
+          learner_note_kr: item.learner_note_kr,
+          grammar_pattern: item.grammar_pattern,
+          register: item.register,
+          example_en: item.example_en,
+          example_kr: item.example_kr,
         })
         changed = true
       }
@@ -992,24 +1160,86 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }, [items])
 
   useEffect(() => {
-    const stored = JSON.parse(localStorage.getItem(`turtle-translations-${episodeId}`) || '{}') as Record<number, string>
-    translationCache.current = stored
-    setTranslations(stored)
-  }, [episodeId])
+    let active = true
+    setTranslationHash('')
+    setTranslations({})
+    translationCache.current = {}
+    setExpandedTranslations(new Set())
+    setTranslationProgress({ completed: 0, total: transcript.length, persistent: false })
+    if (!episodeId || !transcript.length) return () => { active = false }
+    void transcriptDigest(transcript).then((hash) => {
+      if (!active) return
+      setTranslationHash(hash)
+    })
+    return () => { active = false }
+  }, [episodeId, transcript])
 
-  useEffect(() => { localStorage.setItem(`turtle-translations-${episodeId}`, JSON.stringify(translationCache.current)) }, [episodeId, translations])
+  useEffect(() => {
+    if (!translationHash || !transcript.length) return
+    const controller = new AbortController()
+    translationControllerRef.current?.abort()
+    translationControllerRef.current = controller
+    const localKey = `turtle-translations-${episodeId}-${translationHash}-${TRANSLATION_VERSION}`
+    try {
+      const stored = JSON.parse(localStorage.getItem(localKey) || '{}') as Record<number, string>
+      translationCache.current = stored
+      setTranslations(stored)
+    } catch {
+      translationCache.current = {}
+    }
+
+    const prepare = async () => {
+      try {
+        const cacheResponse = await fetch(`${API_BASE_URL}/api/translations/cache`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ video_id: episodeId, transcript_hash: translationHash, translation_version: TRANSLATION_VERSION, total_sentences: transcript.length }),
+          signal: controller.signal,
+        })
+        const cacheData = await readApiJson<TranslationCacheResponse>(cacheResponse)
+        if (!cacheResponse.ok || !cacheData || !('translations' in cacheData)) throw new Error((cacheData && 'detail' in cacheData && cacheData.detail) || '번역 캐시를 불러오지 못했습니다.')
+        cacheData.translations.forEach((item) => { translationCache.current[item.sentence_index] = item.translation_kr })
+        setTranslations({ ...translationCache.current })
+        setTranslationProgress({ completed: Object.keys(translationCache.current).length, total: transcript.length, persistent: cacheData.persistent })
+        localStorage.setItem(localKey, JSON.stringify(translationCache.current))
+
+        const chunks: number[][] = []
+        for (let index = 0; index < transcript.length; index += 25) {
+          const indices = Array.from({ length: Math.min(25, transcript.length - index) }, (_, offset) => index + offset)
+            .filter((sentenceIndex) => !translationCache.current[sentenceIndex])
+          if (indices.length) chunks.push(indices)
+        }
+        const worker = async () => {
+          while (!controller.signal.aborted) {
+            chunks.sort((a, b) => Math.abs((a[0] || 0) - visibleLineIndexRef.current) - Math.abs((b[0] || 0) - visibleLineIndexRef.current))
+            const indices = chunks.shift()
+            if (!indices) return
+            await requestTranslationBatch(indices, '/api/translations/batch', controller.signal)
+            localStorage.setItem(localKey, JSON.stringify(translationCache.current))
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => worker()))
+      } catch (error) {
+        if (!controller.signal.aborted) console.warn('Background translation paused:', error)
+      }
+    }
+    void prepare()
+    return () => controller.abort()
+  }, [episodeId, sourceName, title, transcript, translationHash])
 
   useEffect(() => {
     const controller = new AbortController()
-    const candidates: Array<{ word: string; context: string }> = []
+    const candidates: Array<{ word: string; context: string; sentence_hash: string }> = []
     const scheduled = new Set<string>()
     for (const block of transcript) {
       const words = block.text.match(/[A-Za-z][A-Za-z'’-]*/g) || []
       for (const word of words) {
         const normalized = word.toLocaleLowerCase()
-        if (word.length < 4 || PREFETCH_STOP_WORDS.has(normalized) || scheduled.has(normalized) || definitionCache.current.has(normalized)) continue
-        scheduled.add(normalized)
-        candidates.push({ word, context: block.text.slice(0, 700) })
+        const context = block.text.slice(0, 700)
+        const cacheKey = contextualWordKey(word, context)
+        if (word.length < 4 || PREFETCH_STOP_WORDS.has(normalized) || scheduled.has(cacheKey) || definitionCache.current.has(cacheKey)) continue
+        scheduled.add(cacheKey)
+        candidates.push({ word, context, sentence_hash: fastTextHash(context) })
         if (candidates.length >= 90) break
       }
       if (candidates.length >= 90) break
@@ -1019,16 +1249,18 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
       for (let index = 0; index < candidates.length; index += 30) {
         if (controller.signal.aborted) return
         try {
+          const batch = candidates.slice(index, index + 30)
           const response = await fetch(`${API_BASE_URL}/api/vocabulary/prefetch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ items: candidates.slice(index, index + 30) }),
+            body: JSON.stringify({ items: batch }),
             signal: controller.signal,
           })
           if (!response.ok) return
           const data = await response.json() as { definitions?: WordDefinition[] }
-          data.definitions?.forEach((definition) => {
-            definitionCache.current.set(definition.word.toLocaleLowerCase(), definition)
+          data.definitions?.forEach((definition, definitionIndex) => {
+            const source = batch[definitionIndex]
+            if (source) definitionCache.current.set(contextualWordKey(source.word, source.context), definition)
           })
           storeWordDefinitions(definitionCache.current)
           await new Promise((resolve) => window.setTimeout(resolve, 250))
@@ -1058,7 +1290,13 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
             setPlayerDuration(player.getDuration() || 0)
           },
           onStateChange: (event: { data: number }) => {
-            if (!disposed) setPlaying(event.data === 1)
+            if (disposed) return
+            setPlaying(event.data === 1)
+            if (event.data === 2 || event.data === 0) {
+              const position = player.getCurrentTime() || 0
+              const total = player.getDuration() || durationSec || 0
+              onProgressRef.current(position, total)
+            }
           },
         },
       })
@@ -1075,23 +1313,124 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }, [episodeId, setPlaying])
 
   useEffect(() => {
+    if (!playerReady || restoredEpisodeRef.current === episodeId || initialPositionSec <= 0) return
+    const player = playerRef.current
+    if (!player || typeof player.seekTo !== 'function') return
+    player.seekTo(initialPositionSec, true)
+    setCurrentTime(initialPositionSec)
+    restoredEpisodeRef.current = episodeId
+  }, [episodeId, initialPositionSec, playerReady])
+
+  useEffect(() => {
     if (!playerReady) return
     const timer = window.setInterval(() => {
       const player = playerRef.current
       if (!player || typeof player.getCurrentTime !== 'function' || typeof player.getDuration !== 'function') return
-      setCurrentTime(player.getCurrentTime() || 0)
+      const position = player.getCurrentTime() || 0
+      setCurrentTime(position)
       const actualDuration = player.getDuration()
       if (actualDuration) setPlayerDuration(actualDuration)
+      const sync = lastProgressSyncRef.current
+      const now = Date.now()
+      if (playing && (sync.episodeId !== episodeId || now - sync.syncedAt >= 10_000) && Math.abs(position - sync.position) >= 1) {
+        sync.episodeId = episodeId
+        sync.syncedAt = now
+        sync.position = position
+        onProgressRef.current(position, actualDuration || durationSec || 0)
+      }
     }, 350)
     return () => window.clearInterval(timer)
-  }, [playerReady])
+  }, [durationSec, episodeId, playerReady, playing])
 
   useEffect(() => {
     if (playing && autoFollow && currentIndex >= 0) lineRefs.current[currentIndex]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [autoFollow, currentIndex, playing])
 
-  function c1ItemsForBlock(block: TranscriptBlock) {
-    return items.filter((item) => item.timestamp_sec >= block.timestamp_sec && item.timestamp_sec < block.end_sec && block.text.toLocaleLowerCase().includes(item.target_word.toLocaleLowerCase()))
+  function itemsForBlock(block: TranscriptBlock, sentenceIndex: number) {
+    return items.filter((item) => {
+      const expression = item.expression || item.target_word
+      const assignedToSentence = item.sentence_index === sentenceIndex
+      const assignedByTime = (item.sentence_index ?? -1) < 0 && item.timestamp_sec >= block.timestamp_sec && item.timestamp_sec < block.end_sec
+      return (assignedToSentence || assignedByTime) && block.text.toLocaleLowerCase().includes(expression.toLocaleLowerCase())
+    })
+  }
+
+  async function withTranslationSlot<T>(task: () => Promise<T>) {
+    const slots = translationSlotsRef.current
+    if (slots.active >= 2) await new Promise<void>((resolve) => slots.waiters.push(resolve))
+    slots.active += 1
+    try {
+      return await task()
+    } finally {
+      slots.active -= 1
+      slots.waiters.shift()?.()
+    }
+  }
+
+  async function requestTranslationBatch(indices: number[], endpoint: '/api/translations/batch' | '/api/translations/lookup', signal?: AbortSignal) {
+    const uniqueIndices = [...new Set(indices)].filter((index) => transcript[index] && !translationCache.current[index])
+    if (!uniqueIndices.length) return
+    const sentences = uniqueIndices.map((index) => ({
+      sentence_index: index,
+      text: transcript[index].text,
+      previous_text: transcript[index - 1]?.text || '',
+      next_text: transcript[index + 1]?.text || '',
+    }))
+    const response = await withTranslationSlot(() => fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        video_id: episodeId,
+        transcript_hash: translationHash,
+        translation_version: TRANSLATION_VERSION,
+        total_sentences: transcript.length,
+        title,
+        channel_name: sourceName,
+        topic: title,
+        sentences,
+      }),
+      signal,
+    }))
+    const data = await readApiJson<TranslationCacheResponse>(response)
+    if (!response.ok || !data || !('translations' in data)) throw new Error((data && 'detail' in data && data.detail) || '번역을 불러오지 못했습니다.')
+    data.translations.forEach((item) => { translationCache.current[item.sentence_index] = item.translation_kr })
+    setTranslations({ ...translationCache.current })
+    setTranslationProgress({ completed: Object.keys(translationCache.current).length, total: transcript.length, persistent: data.persistent })
+  }
+
+  function handleReadingScroll() {
+    const container = readingBodyRef.current
+    if (!container) return
+    const top = container.getBoundingClientRect().top
+    let closest = visibleLineIndexRef.current
+    let distance = Number.POSITIVE_INFINITY
+    lineRefs.current.forEach((element, index) => {
+      if (!element) return
+      const nextDistance = Math.abs(element.getBoundingClientRect().top - top - 12)
+      if (nextDistance < distance) {
+        distance = nextDistance
+        closest = index
+      }
+    })
+    visibleLineIndexRef.current = closest
+    setVisibleLineIndex(closest)
+  }
+
+  function handlePointerDown(event: PointerEvent<HTMLParagraphElement>) {
+    pointerStartRef.current = { x: event.clientX, y: event.clientY }
+    setPalette(null)
+  }
+
+  function finishPointerSelection(event: PointerEvent<HTMLParagraphElement>, line: number, rawText: string) {
+    const movement = Math.hypot(event.clientX - pointerStartRef.current.x, event.clientY - pointerStartRef.current.y)
+    const isMouseDrag = event.pointerType === 'mouse' && movement > 4
+    const isTouchSelection = event.pointerType !== 'mouse'
+    if (!isMouseDrag && !isTouchSelection) {
+      setPalette(null)
+      return
+    }
+    dragGuardUntilRef.current = performance.now() + 350
+    handleSelection(event, line, rawText)
   }
 
   function togglePlayback() {
@@ -1110,7 +1449,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }
 
   function playFromTranscript(event: MouseEvent<HTMLDivElement>, seconds: number) {
-    if (window.getSelection()?.toString().trim()) return
+    if (performance.now() < dragGuardUntilRef.current) return
     const target = event.target as HTMLElement
     if (target.closest('button, input, a, .hint-wrap, .wordwise')) return
     seekTo(seconds, true)
@@ -1144,6 +1483,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
         return
       }
       const end = Math.min(rawText.length, start + selectedLength)
+      dragGuardUntilRef.current = performance.now() + 350
       const selectionRects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
       const rangeRect = range.getBoundingClientRect()
       const releaseX = pointerX || rangeRect.right
@@ -1169,64 +1509,89 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
     setPalette(null)
   }
 
-  async function toggleTranslation() {
-    if (!palette) return
-    const lineIndex = palette.line
+  async function toggleLineTranslation(lineIndex: number) {
     const block = transcript[lineIndex]
     window.getSelection()?.removeAllRanges()
     setPalette(null)
     if (!block) return
-    if (translations[lineIndex]) {
-      setTranslations((now) => { const next = { ...now }; delete next[lineIndex]; return next })
+    if (expandedTranslations.has(lineIndex)) {
+      setExpandedTranslations((current) => { const next = new Set(current); next.delete(lineIndex); return next })
       return
     }
     const cached = translationCache.current[lineIndex]
-    if (cached) return setTranslations((now) => ({ ...now, [lineIndex]: cached }))
-    setTranslationLoading(lineIndex)
+    if (cached) {
+      setExpandedTranslations((current) => new Set(current).add(lineIndex))
+      return
+    }
+    setTranslationLoading((current) => new Set(current).add(lineIndex))
     try {
-      const response = await fetch(`${API_BASE_URL}/api/translations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: block.text }) })
-      const data = await response.json().catch(() => null) as TranslationResponse | { detail?: string } | null
-      if (!response.ok || !data || !('translation_kr' in data)) throw new Error(data && 'detail' in data ? data.detail : '번역을 불러오지 못했습니다.')
-      translationCache.current[lineIndex] = data.translation_kr
-      setTranslations((now) => ({ ...now, [lineIndex]: data.translation_kr }))
+      await requestTranslationBatch([lineIndex], '/api/translations/lookup')
+      setExpandedTranslations((current) => new Set(current).add(lineIndex))
     } catch (error) {
-      setTranslations((now) => ({ ...now, [lineIndex]: error instanceof Error ? error.message : '번역을 불러오지 못했습니다.' }))
-    } finally { setTranslationLoading(null) }
+      const message = error instanceof Error ? error.message : '번역을 불러오지 못했습니다.'
+      setTranslations((current) => ({ ...current, [lineIndex]: message }))
+      setExpandedTranslations((current) => new Set(current).add(lineIndex))
+    } finally {
+      setTranslationLoading((current) => { const next = new Set(current); next.delete(lineIndex); return next })
+    }
   }
 
-  async function openWord(word: string, event: MouseEvent<HTMLElement>, context: string) {
+  async function openWord(word: string, event: MouseEvent<HTMLElement>, context: string, charOffset: number, sentenceIndex: number) {
     event.stopPropagation()
-    if (window.getSelection()?.toString().trim()) return
-    const normalized = normalizeWordKey(word)
-    if (wordPopover?.wordKey === normalized) {
+    if (performance.now() < dragGuardUntilRef.current) return
+    window.getSelection()?.removeAllRanges()
+    const matchingExpressions = itemsForBlock(transcript[sentenceIndex], sentenceIndex)
+      .map((item) => {
+        const expression = item.expression || item.target_word
+        const start = (item.start_char ?? -1) >= 0 ? item.start_char! : context.toLocaleLowerCase().indexOf(expression.toLocaleLowerCase())
+        return { item, expression, start, end: start + expression.length }
+      })
+      .filter((candidate) => candidate.start >= 0 && charOffset >= candidate.start && charOffset < candidate.end)
+      .sort((a, b) => (b.end - b.start) - (a.end - a.start))
+    const analyzed = matchingExpressions[0]
+    const lookupWord = analyzed?.expression || word
+    const cacheKey = contextualWordKey(lookupWord, context)
+    if (wordPopover?.wordKey === cacheKey) {
       if (wordPopover.loading) return
       if (wordPopover.saved) {
         return
       }
       saveWord(wordPopover.data.word, wordPopover.data)
-      setWordPopover((current) => current?.wordKey === normalized ? { ...current, saved: true } : current)
+      setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, saved: true } : current)
       return
     }
     const x = Math.max(130, Math.min(event.clientX, window.innerWidth - 130))
     const y = Math.max(90, event.clientY - 12)
-    const alreadySaved = savedWords.some((item) => normalizeWordKey(item) === normalized)
-    const cached = definitionCache.current.get(normalized)
-    if (cached) return setWordPopover({ wordKey: normalized, x, y, loading: false, saved: alreadySaved, data: cached })
-    const fallback: WordDefinition = { word, word_type: 'word', definition_kr: '문맥에 맞는 뜻을 불러오는 중이에요.' }
-    setWordPopover({ wordKey: normalized, x, y, loading: true, saved: alreadySaved, data: fallback })
+    const alreadySaved = savedWords.some((item) => normalizeWordKey(item) === normalizeWordKey(lookupWord))
+    const analyzedDefinition: WordDefinition | null = analyzed ? {
+      word: analyzed.expression,
+      word_type: analyzed.item.word_type,
+      definition_kr: analyzed.item.definition_kr,
+      expression_type: analyzed.item.expression_type,
+      literal_meaning_kr: analyzed.item.literal_meaning_kr,
+      learner_note_kr: analyzed.item.learner_note_kr,
+      grammar_pattern: analyzed.item.grammar_pattern,
+      register: analyzed.item.register,
+      example_en: analyzed.item.example_en,
+      example_kr: analyzed.item.example_kr,
+    } : null
+    const cached = analyzedDefinition || definitionCache.current.get(cacheKey)
+    if (cached) return setWordPopover({ wordKey: cacheKey, x, y, loading: false, saved: alreadySaved, data: cached })
+    const fallback: WordDefinition = { word: lookupWord, word_type: 'word', definition_kr: '문맥에 맞는 뜻을 불러오는 중이에요.' }
+    setWordPopover({ wordKey: cacheKey, x, y, loading: true, saved: alreadySaved, data: fallback })
     try {
-      const response = await fetch(`${API_BASE_URL}/api/vocabulary/define`, {
+      const response = await fetch(`${API_BASE_URL}/api/vocabulary/lookup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word, context }),
+        body: JSON.stringify({ word, context, clicked_offset: charOffset, sentence_hash: fastTextHash(context) }),
       })
       const data = await response.json().catch(() => null) as WordDefinition | { detail?: string } | null
       if (!response.ok || !data || !('word' in data)) throw new Error(data && 'detail' in data ? data.detail : '뜻을 불러오지 못했습니다.')
-      definitionCache.current.set(normalized, data)
+      definitionCache.current.set(cacheKey, data)
       storeWordDefinitions(definitionCache.current)
-      setWordPopover((current) => current?.wordKey === normalized ? { ...current, loading: false, data } : current)
+      setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, loading: false, data } : current)
     } catch (error) {
-      setWordPopover((current) => current?.wordKey === normalized ? { ...current, loading: false, data: fallback, error: error instanceof Error ? error.message : '뜻을 불러오지 못했습니다.' } : current)
+      setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, loading: false, data: fallback, error: error instanceof Error ? error.message : '뜻을 불러오지 못했습니다.' } : current)
     }
   }
 
@@ -1255,29 +1620,34 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
         <div><span>FULL TRANSCRIPT</span><h2>전체 스크립트</h2></div>
         <label className="follow-toggle"><span>자동으로 따라가기</span><input type="checkbox" checked={autoFollow} onChange={(event) => setAutoFollow(event.target.checked)} /><i aria-hidden="true" /><b>{autoFollow ? 'ON' : 'OFF'}</b></label>
       </div>
-      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{transcript.length ? (playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요') : '이 영상에는 동기화할 영어 자막이 없어요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 단어 분석 중… {analysisProgress.completed}/{analysisProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{Math.max(0, currentIndex + 1)} / {transcript.length}</b></div>
-      <div className="transcript-body reading-body">
+      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{transcript.length ? (playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요') : '이 영상에는 동기화할 영어 자막이 없어요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 표현 {analysisProgress.completed}/{analysisProgress.total}</em>}{translationProgress.total > 0 && translationProgress.completed < translationProgress.total && <em>한국어 자막 {translationProgress.completed}/{translationProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{Math.max(0, currentIndex + 1)} / {transcript.length}</b></div>
+      <div ref={readingBodyRef} className="transcript-body reading-body" onScroll={handleReadingScroll}>
         {!transcript.length && <div className="empty-state">YouTube에서 사용할 수 있는 영어 자막을 제공하지 않아 전체 스크립트를 만들 수 없습니다.<br /><small>영상은 위 플레이어에서 그대로 재생할 수 있어요.</small></div>}
         {transcript.map((line, index) => {
           const sentenceSaved = savedSentences.some((sentence) => savedSentenceKey(sentence.videoId, sentence) === savedSentenceKey(episodeId, { time: line.timestamp_display, text: line.text, timestampSec: line.timestamp_sec }))
           return <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`} onClick={(event) => playFromTranscript(event, line.timestamp_sec)}>
             <span className="timestamp">{line.timestamp_display}</span>
-            <div className="script-copy"><p onPointerDown={() => setPalette(null)} onPointerUp={(event) => handleSelection(event, index, line.text)}><InteractiveScriptText text={line.text} c1Items={c1ItemsForBlock(line)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event) => openWord(word, event, line.text)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading === index && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
-            <button type="button" className={`sentence-save-button ${sentenceSaved ? 'saved' : ''}`} aria-label={sentenceSaved ? '문장 금고에 저장됨' : '문장 금고에 저장'} aria-pressed={sentenceSaved} onClick={(event) => { event.stopPropagation(); saveSentence(line) }}>{sentenceSaved ? '♥' : '♡'}</button>
+            <div className="script-copy"><p onPointerDown={handlePointerDown} onPointerUp={(event) => finishPointerSelection(event, index, line.text)}><InteractiveScriptText text={line.text} sentenceIndex={index} items={itemsForBlock(line, index)} highlights={highlights.filter((item) => item.line === index)} completedWords={completedWords} onWordClick={(word, event, charOffset) => openWord(word, event, line.text, charOffset, index)} onSaveWord={saveWord} onCompleteWord={completeWord} /></p>{translationLoading.has(index) && <span className="line-translation loading">자연스러운 번역을 준비하고 있어요…</span>}{expandedTranslations.has(index) && translations[index] && <span className="line-translation">{translations[index]}</span>}</div>
+            <div className="sentence-actions">
+              <button type="button" className={`sentence-translation-button ${expandedTranslations.has(index) ? 'active' : ''} ${translations[index] ? 'ready' : ''}`} aria-label={expandedTranslations.has(index) ? '한국어 자막 접기' : '한국어 자막 펼치기'} aria-pressed={expandedTranslations.has(index)} disabled={!translationHash} onClick={(event) => { event.stopPropagation(); void toggleLineTranslation(index) }}>한</button>
+              <button type="button" className={`sentence-save-button ${sentenceSaved ? 'saved' : ''}`} aria-label={sentenceSaved ? '문장 금고에 저장됨' : '문장 금고에 저장'} aria-pressed={sentenceSaved} onClick={(event) => { event.stopPropagation(); saveSentence(line) }}>{sentenceSaved ? '♥' : '♡'}</button>
+            </div>
           </div>
         })}
       </div>
       <div className="script-tip"><span>⌁</span><p><b>Tip.</b> 블록의 빈 곳을 누르면 그 시점부터 재생해요. B2·C1 빈칸은 한 번 눌러 입력하고, 두 번 눌러 정답을 확인할 수 있어요.</p></div>
       {palette && createPortal(<div className={`selection-palette ${palette.placement}`} style={{ left: palette.x, top: palette.y }} role="toolbar" aria-label="선택한 텍스트 도구">
         <button className="selection-tool highlight-tool" onPointerDown={(event) => event.preventDefault()} onClick={colorSelection} aria-label="노란색 형광펜 적용 또는 해제">○</button>
-        <span className="selection-divider" aria-hidden="true" />
-        <button className="selection-tool translation-tool" onPointerDown={(event) => event.preventDefault()} onClick={toggleTranslation} aria-label="한국어 번역 펼치기 또는 접기">한</button>
       </div>, document.body)}
-      {wordPopover && <aside className="word-popover" style={{ left: wordPopover.x, top: wordPopover.y }} role="status">
+      {wordPopover && createPortal(<aside className="word-popover" style={{ left: wordPopover.x, top: wordPopover.y }} role="status">
         <button onClick={() => setWordPopover(null)} aria-label="단어 뜻 닫기">×</button>
-        <b>{wordPopover.data.word}</b><small>{wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>{wordPopover.loading && <i className="popover-loader" />}
+        <b>{wordPopover.data.word}</b><small>{wordPopover.data.expression_type && wordPopover.data.expression_type !== 'vocabulary' ? `${wordPopover.data.expression_type.replace('_', ' ')} · ` : ''}{wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>
+        {wordPopover.data.learner_note_kr && <p className="learner-note">헷갈리기 쉬운 점 · {wordPopover.data.learner_note_kr}</p>}
+        {wordPopover.data.grammar_pattern && <code>{wordPopover.data.grammar_pattern}</code>}
+        {wordPopover.data.example_en && <p className="word-example">{wordPopover.data.example_en}<br /><small>{wordPopover.data.example_kr}</small></p>}
+        {wordPopover.loading && <i className="popover-loader" />}
         <span>{wordPopover.saved ? '짐가방에 저장됨' : wordPopover.loading ? '뜻을 불러오는 중이에요' : '같은 단어를 한 번 더 누르면 저장돼요'}</span>
-      </aside>}
+      </aside>, document.body)}
     </article>
   </div>
 }

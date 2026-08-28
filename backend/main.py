@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -34,8 +35,14 @@ load_dotenv()
 
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 TRANSCRIPT_CHUNK_CHARACTER_LIMIT = 28_000
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-ANALYSIS_VERSION = "b2-c1-phrasal-v1"
+OPENAI_ANALYSIS_MODEL = os.getenv(
+    "OPENAI_ANALYSIS_MODEL", os.getenv("OPENAI_MODEL", "gpt-5-mini")
+)
+OPENAI_TRANSLATION_MODEL = os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-5-mini")
+OPENAI_LOOKUP_MODEL = os.getenv("OPENAI_LOOKUP_MODEL", "gpt-5-mini")
+OPENAI_MODEL = OPENAI_ANALYSIS_MODEL
+ANALYSIS_VERSION = "korean-expression-ranges-v2"
+TRANSLATION_VERSION = "ko-editorial-v1"
 IS_VERCEL = bool(os.getenv("VERCEL"))
 SUPADATA_API_URL = os.getenv(
     "SUPADATA_API_URL", "https://api.supadata.ai/v1"
@@ -49,7 +56,7 @@ CACHE_DIRECTORY = Path(
         else Path(__file__).resolve().parent / ".cache"
     )
 )
-WORD_CACHE_VERSION = "context-dictionary-v1"
+WORD_CACHE_VERSION = "context-dictionary-v2"
 WORD_CACHE_PATH = CACHE_DIRECTORY / f"{WORD_CACHE_VERSION}.json"
 
 
@@ -76,6 +83,8 @@ class AnalyzeEpisodeRequest(BaseModel):
 
 
 class LearningItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     timestamp_sec: float = Field(ge=0)
     timestamp_display: str
     full_sentence_original: str
@@ -86,6 +95,23 @@ class LearningItem(BaseModel):
     hint_for_tap: str
     level: Literal["B2", "C1"] = "C1"
     is_phrasal_verb: bool = False
+    sentence_index: int = -1
+    expression: str = ""
+    expression_type: Literal[
+        "vocabulary", "phrasal_verb", "idiom", "collocation"
+    ] = "vocabulary"
+    anchor_words: list[str] = Field(default_factory=list)
+    literal_meaning_kr: str = ""
+    learner_note_kr: str = ""
+    grammar_pattern: str = ""
+    register_label: str = Field(
+        default="neutral", alias="register", serialization_alias="register"
+    )
+    example_en: str = ""
+    example_kr: str = ""
+    start_char: int = -1
+    end_char: int = -1
+    is_dictation_target: bool = True
 
 
 class LearningItemsPayload(BaseModel):
@@ -153,12 +179,27 @@ class DefineWordRequest(BaseModel):
 
     word: str = Field(min_length=1, max_length=80)
     context: str = Field(min_length=1, max_length=1_000)
+    clicked_offset: int = Field(default=-1, ge=-1, le=10_000)
+    sentence_hash: str = Field(default="", max_length=128)
 
 
 class WordDefinition(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     word: str
     word_type: str
     definition_kr: str
+    expression_type: Literal[
+        "vocabulary", "phrasal_verb", "idiom", "collocation"
+    ] = "vocabulary"
+    literal_meaning_kr: str = ""
+    learner_note_kr: str = ""
+    grammar_pattern: str = ""
+    register_label: str = Field(
+        default="neutral", alias="register", serialization_alias="register"
+    )
+    example_en: str = ""
+    example_kr: str = ""
 
 
 class TranslateSentenceRequest(BaseModel):
@@ -169,6 +210,48 @@ class TranslateSentenceRequest(BaseModel):
 
 class TranslationResponse(BaseModel):
     translation_kr: str
+
+
+class TranslationSentence(BaseModel):
+    sentence_index: int = Field(ge=0)
+    text: str = Field(min_length=1, max_length=3_000)
+    previous_text: str = Field(default="", max_length=3_000)
+    next_text: str = Field(default="", max_length=3_000)
+
+
+class TranslationItem(BaseModel):
+    sentence_index: int = Field(ge=0)
+    translation_kr: str
+
+
+class TranslationItemsPayload(BaseModel):
+    translations: list[TranslationItem]
+
+
+class TranslationCacheRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
+    transcript_hash: str = Field(min_length=8, max_length=128)
+    translation_version: str = Field(default=TRANSLATION_VERSION, max_length=80)
+    total_sentences: int = Field(ge=0, le=20_000)
+
+
+class TranslationBatchRequest(TranslationCacheRequest):
+    title: str = Field(default="", max_length=500)
+    channel_name: str = Field(default="", max_length=500)
+    topic: str = Field(default="", max_length=1_000)
+    sentences: list[TranslationSentence] = Field(min_length=1, max_length=30)
+
+
+class TranslationCacheResponse(BaseModel):
+    video_id: str
+    transcript_hash: str
+    translation_version: str
+    translations: list[TranslationItem] = Field(default_factory=list)
+    completed: int = 0
+    total: int = 0
+    persistent: bool = False
 
 
 class BatchDefineWordsRequest(BaseModel):
@@ -183,6 +266,7 @@ app = FastAPI(title="Turtle English API", version="1.0.0")
 app.state.analysis_jobs = {}
 app.state.analysis_tasks = set()
 app.state.word_definition_cache = None
+app.state.translation_cache = {}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4173", "http://127.0.0.1:4173"],
@@ -522,15 +606,17 @@ def make_prompt(transcript_chunk: str, chunk_index: int, chunk_count: int) -> st
 아래는 YouTube 영어 자막 전체 중 {chunk_index}/{chunk_count} 구간입니다.
 
 요구사항:
-1. 자막의 문장부호, 대소문자, 띄어쓰기를 문맥에 맞게 교정하고 인접 자막을 자연스러운 문장으로 결합하세요.
-2. B2 또는 C1 학습 가치가 높은 어휘와 실용적인 구동사를 선별하세요. 쉬운 A1~B1 단어와 고유명사는 제외하세요.
-3. 각 항목은 해당 표현이 처음 발화되는 정확한 원본 타임스탬프를 사용하세요.
-4. masked_sentence에는 target_word의 일부 또는 전체만 밑줄로 가리세요. 나머지 문맥은 유지하세요.
-5. definition_kr에는 간결하고 문맥에 맞는 한국어 뜻을 쓰세요.
-6. hint_for_tap에는 짧고 직관적인 영어 정의를 쓰세요.
-7. 이 구간의 경계에서 문장이 불완전하다면 추측해서 항목을 만들지 마세요.
-8. level은 반드시 B2 또는 C1로 분류하고, 구동사는 is_phrasal_verb를 true로 설정하세요.
-9. 응답 스키마에 맞는 데이터만 반환하세요.
+1. 입력 문장은 화면에 그대로 표시되는 최종 전사문입니다. 문장을 고치거나 다시 쓰지 마세요.
+2. 일반 단어는 B2~C1 중 학습 가치가 높은 것만 고르세요. 쉬운 A1~B1 일반 단어와 고유명사는 제외하세요.
+3. 구동사·이디엄·콜로케이션은 CEFR 난이도가 낮아도 한국인 학습자가 문맥상 혼동하기 쉽거나 활용 가치가 높으면 포함하세요.
+4. 각 줄의 sentence_index와 원본 타임스탬프를 그대로 반환하세요. expression과 target_word에는 동일한 실제 표현을 넣으세요.
+5. start_char와 end_char는 해당 줄의 문장 문자열에서 expression이 차지하는 0 기반 문자 범위이며 end_char는 포함하지 않습니다.
+6. expression_type은 vocabulary, phrasal_verb, idiom, collocation 중 하나로 분류하세요. 구동사는 is_phrasal_verb도 true로 설정하세요.
+7. definition_kr은 문맥상 뜻, literal_meaning_kr은 직역 의미, learner_note_kr은 한국인이 혼동하기 쉬운 점을 짧게 쓰세요.
+8. grammar_pattern, register, 자연스러운 example_en/example_kr, anchor_words를 제공하세요.
+9. 실제 받아쓰기에 적합한 핵심 B2/C1 항목만 is_dictation_target=true로 하고, 보조 설명용 표현은 false로 하세요.
+10. masked_sentence에는 받아쓰기 항목일 때만 expression 일부를 밑줄로 가리고 나머지 문맥은 유지하세요.
+11. level은 B2 또는 C1 중 가까운 수준으로 분류하고 응답 스키마에 맞는 데이터만 반환하세요.
 
 자막:
 {transcript_chunk}
@@ -542,9 +628,10 @@ def analyze_chunk(
 ) -> list[LearningItem]:
     client = OpenAI(api_key=api_key)
     response = client.responses.parse(
-        model=OPENAI_MODEL,
+        model=OPENAI_ANALYSIS_MODEL,
         input=make_prompt(transcript_chunk, chunk_index, chunk_count),
         text_format=LearningItemsPayload,
+        reasoning={"effort": "low"},
         store=False,
     )
     parsed = response.output_parsed
@@ -671,16 +758,21 @@ async def run_analysis_job(
         job["error"] = public_analysis_error(error)
 
 
-def define_word(word: str, context: str, api_key: str) -> WordDefinition:
+def define_word(
+    word: str, context: str, clicked_offset: int, api_key: str
+) -> WordDefinition:
     client = OpenAI(api_key=api_key)
     response = client.responses.parse(
-        model=OPENAI_MODEL,
+        model=OPENAI_LOOKUP_MODEL,
         input=(
-            "다음 영어 단어를 주어진 문맥에 맞춰 한국어 학습자용으로 설명하세요. "
-            "품사는 영어로 간결하게 쓰고, 뜻은 한국어 한 줄로 쓰세요.\n\n"
-            f"단어: {word}\n문맥: {context}"
+            "당신은 한국인 영어 학습자를 위한 문맥 사전입니다. 클릭한 단어가 포함된 "
+            "구동사·이디엄·콜로케이션이 있으면 단어 하나가 아니라 가장 긴 실제 표현을 우선 반환하세요. "
+            "그런 표현이 없을 때만 일반 단어를 반환하세요. definition_kr은 문맥상 자연스러운 뜻, "
+            "learner_note_kr은 한국인이 혼동하기 쉬운 점, grammar_pattern은 결합 형태를 간결하게 씁니다.\n\n"
+            f"클릭 단어: {word}\n클릭 문자 위치: {clicked_offset}\n문장: {context}"
         ),
         text_format=WordDefinition,
+        reasoning={"effort": "low"},
         store=False,
     )
     if response.output_parsed is not None:
@@ -693,13 +785,14 @@ def define_word(word: str, context: str, api_key: str) -> WordDefinition:
 def translate_sentence(text: str, api_key: str) -> TranslationResponse:
     client = OpenAI(api_key=api_key)
     response = client.responses.parse(
-        model=OPENAI_MODEL,
+        model=OPENAI_TRANSLATION_MODEL,
         input=(
             "다음 영어 문장을 문맥과 어조를 살린 자연스러운 한국어로 번역하세요. "
             "단어 대 단어 직역을 피하고, 설명이나 따옴표 없이 번역문만 반환하세요.\n\n"
             f"영어 문장: {text}"
         ),
         text_format=TranslationResponse,
+        reasoning={"effort": "low"},
         store=False,
     )
     if response.output_parsed is not None:
@@ -715,7 +808,7 @@ def define_words(
     client = OpenAI(api_key=api_key)
     input_items = [item.model_dump() for item in items]
     response = client.responses.parse(
-        model=OPENAI_MODEL,
+        model=OPENAI_LOOKUP_MODEL,
         input=(
             "아래 영어 단어들을 각각 주어진 문맥에 맞춰 한국어 학습자용으로 설명하세요. "
             "입력된 모든 단어를 정확히 한 번씩 반환하고, word는 입력 철자를 유지하세요. "
@@ -723,6 +816,7 @@ def define_words(
             f"입력: {json.dumps(input_items, ensure_ascii=False)}"
         ),
         text_format=WordDefinitionsPayload,
+        reasoning={"effort": "low"},
         store=False,
     )
     parsed = response.output_parsed
@@ -771,12 +865,157 @@ def get_word_definition_cache(request: Request) -> dict[str, WordDefinition]:
     return cache
 
 
+def stable_text_hash(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip().casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def word_cache_key(word: str, context: str, supplied_hash: str = "") -> str:
+    sentence_hash = supplied_hash.strip() or stable_text_hash(context)
+    return f"{word.casefold().strip()}:{sentence_hash}"
+
+
+def supabase_server_config() -> tuple[str, str] | None:
+    url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not url or not key:
+        return None
+    return url, key
+
+
+def supabase_headers(prefer: str = "") -> dict[str, str]:
+    config = supabase_server_config()
+    if not config:
+        return {}
+    _, key = config
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def read_supabase_translations(
+    video_id: str, transcript_hash: str, translation_version: str
+) -> list[TranslationItem]:
+    config = supabase_server_config()
+    if not config:
+        return []
+    url, _ = config
+    response = requests.get(
+        f"{url}/rest/v1/episode_translations",
+        headers=supabase_headers(),
+        params={
+            "select": "sentence_index,translation_kr",
+            "video_id": f"eq.{video_id}",
+            "transcript_hash": f"eq.{transcript_hash}",
+            "translation_version": f"eq.{translation_version}",
+            "order": "sentence_index.asc",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return [TranslationItem.model_validate(row) for row in response.json()]
+
+
+def write_supabase_translations(
+    request_payload: TranslationBatchRequest, items: Sequence[TranslationItem]
+) -> None:
+    config = supabase_server_config()
+    if not config or not items:
+        return
+    url, _ = config
+    source_by_index = {
+        sentence.sentence_index: sentence.text for sentence in request_payload.sentences
+    }
+    rows = [
+        {
+            "video_id": request_payload.video_id,
+            "transcript_hash": request_payload.transcript_hash,
+            "translation_version": request_payload.translation_version,
+            "sentence_index": item.sentence_index,
+            "source_text_hash": stable_text_hash(source_by_index[item.sentence_index]),
+            "translation_kr": item.translation_kr,
+            "model": OPENAI_TRANSLATION_MODEL,
+        }
+        for item in items
+        if item.sentence_index in source_by_index
+    ]
+    response = requests.post(
+        f"{url}/rest/v1/episode_translations",
+        headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
+        params={
+            "on_conflict": "video_id,transcript_hash,translation_version,sentence_index"
+        },
+        json=rows,
+        timeout=20,
+    )
+    response.raise_for_status()
+
+
+def translate_sentences(
+    payload: TranslationBatchRequest, api_key: str
+) -> list[TranslationItem]:
+    client = OpenAI(api_key=api_key)
+    input_rows = [sentence.model_dump() for sentence in payload.sentences]
+    response = client.responses.parse(
+        model=OPENAI_TRANSLATION_MODEL,
+        reasoning={"effort": "low"},
+        input=(
+            "당신은 한국의 시사·교양 콘텐츠 자막 편집자입니다. 영어 어순을 유지하는 직역을 피하고 "
+            "한국어 화자가 실제로 말하고 읽는 자연스러운 어순으로 재구성하세요. 고유명사, 수치, "
+            "인과관계와 화자의 확신 정도는 유지하고, 이디엄과 구동사는 문맥상 의미로 의역하세요. "
+            "각 현재 문장은 previous_text와 next_text를 문맥으로만 참고하고 번역 결과에는 현재 문장만 넣으세요. "
+            "입력 sentence_index를 그대로 보존하고 모든 입력을 정확히 한 번 반환하세요.\n\n"
+            f"영상 제목: {payload.title}\n채널: {payload.channel_name}\n주제: {payload.topic or payload.title}\n"
+            f"문장: {json.dumps(input_rows, ensure_ascii=False)}"
+        ),
+        text_format=TranslationItemsPayload,
+        store=False,
+    )
+    parsed = response.output_parsed
+    if parsed is None:
+        if not response.output_text:
+            raise RuntimeError("OpenAI가 빈 번역을 반환했습니다.")
+        parsed = TranslationItemsPayload.model_validate_json(response.output_text)
+    allowed = {sentence.sentence_index for sentence in payload.sentences}
+    unique: dict[int, TranslationItem] = {}
+    for item in parsed.translations:
+        if item.sentence_index in allowed and item.translation_kr.strip():
+            unique[item.sentence_index] = item
+    return [unique[index] for index in sorted(unique)]
+
+
 def normalize_items(items: Iterable[LearningItem]) -> list[LearningItem]:
     """Sort results and remove likely duplicates created at chunk boundaries."""
     unique: dict[tuple[int, str], LearningItem] = {}
     for item in items:
+        item.expression = (item.expression or item.target_word).strip()
+        item.target_word = item.expression
+        item.anchor_words = item.anchor_words or re.findall(
+            r"[A-Za-z][A-Za-z'’-]*", item.expression
+        )
+        item.is_phrasal_verb = item.expression_type == "phrasal_verb"
+        sentence = item.full_sentence_original
+        if sentence:
+            expected = sentence[item.start_char : item.end_char]
+            if (
+                item.start_char < 0
+                or item.end_char <= item.start_char
+                or expected.casefold() != item.expression.casefold()
+            ):
+                start = sentence.casefold().find(item.expression.casefold())
+                if start >= 0:
+                    item.start_char = start
+                    item.end_char = start + len(item.expression)
+                else:
+                    item.start_char = -1
+                    item.end_char = -1
         item.timestamp_display = format_timestamp(item.timestamp_sec)
-        key = (round(item.timestamp_sec), item.target_word.casefold().strip())
+        key = (item.sentence_index, item.expression.casefold().strip())
         unique.setdefault(key, item)
     return sorted(unique.values(), key=lambda item: item.timestamp_sec)
 
@@ -833,7 +1072,7 @@ async def get_word_definition(
     payload: DefineWordRequest, request: Request
 ) -> WordDefinition:
     cache = get_word_definition_cache(request)
-    cache_key = payload.word.casefold().strip()
+    cache_key = word_cache_key(payload.word, payload.context, payload.sentence_hash)
     if cache_key in cache:
         return cache[cache_key]
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -844,7 +1083,7 @@ async def get_word_definition(
         )
     try:
         definition = await asyncio.to_thread(
-            define_word, payload.word, payload.context, api_key
+            define_word, payload.word, payload.context, payload.clicked_offset, api_key
         )
         cache[cache_key] = definition
         await asyncio.to_thread(write_word_definition_cache, cache.copy())
@@ -864,6 +1103,13 @@ async def get_word_definition(
             status_code=502,
             detail="단어 뜻을 불러오지 못했습니다.",
         ) from error
+
+
+@app.post("/api/vocabulary/lookup", response_model=WordDefinition)
+async def lookup_vocabulary_expression(
+    payload: DefineWordRequest, request: Request
+) -> WordDefinition:
+    return await get_word_definition(payload, request)
 
 
 @app.post("/api/translations", response_model=TranslationResponse)
@@ -893,7 +1139,9 @@ async def prefetch_word_definitions(
     cache = get_word_definition_cache(request)
     requested: dict[str, DefineWordRequest] = {}
     for item in payload.items:
-        requested.setdefault(item.word.casefold().strip(), item)
+        requested.setdefault(
+            word_cache_key(item.word, item.context, item.sentence_hash), item
+        )
 
     missing = [item for key, item in requested.items() if key not in cache]
     if missing:
@@ -901,10 +1149,13 @@ async def prefetch_word_definitions(
         if api_key:
             try:
                 definitions = await asyncio.to_thread(define_words, missing, api_key)
-                for definition in definitions:
-                    key = definition.word.casefold().strip()
-                    if key in requested:
-                        cache[key] = definition
+                for request_item, definition in zip(missing, definitions, strict=False):
+                    key = word_cache_key(
+                        request_item.word,
+                        request_item.context,
+                        request_item.sentence_hash,
+                    )
+                    cache[key] = definition
                 await asyncio.to_thread(write_word_definition_cache, cache.copy())
             except AuthenticationError as error:
                 raise HTTPException(
@@ -922,6 +1173,141 @@ async def prefetch_word_definitions(
     return WordDefinitionsPayload(
         definitions=[cache[key] for key in requested if key in cache]
     )
+
+
+def translation_memory_key(
+    video_id: str, transcript_hash: str, translation_version: str
+) -> str:
+    return f"{video_id}:{transcript_hash}:{translation_version}"
+
+
+@app.post("/api/translations/cache", response_model=TranslationCacheResponse)
+async def get_translation_cache(
+    payload: TranslationCacheRequest, request: Request
+) -> TranslationCacheResponse:
+    key = translation_memory_key(
+        payload.video_id, payload.transcript_hash, payload.translation_version
+    )
+    memory: dict[int, TranslationItem] = request.app.state.translation_cache.setdefault(
+        key, {}
+    )
+    persistent = bool(supabase_server_config())
+    if persistent:
+        try:
+            remote = await asyncio.to_thread(
+                read_supabase_translations,
+                payload.video_id,
+                payload.transcript_hash,
+                payload.translation_version,
+            )
+            memory.update({item.sentence_index: item for item in remote})
+        except requests.RequestException as error:
+            raise HTTPException(
+                status_code=502,
+                detail="Supabase 번역 캐시를 불러오지 못했습니다.",
+            ) from error
+    items = [memory[index] for index in sorted(memory)]
+    return TranslationCacheResponse(
+        video_id=payload.video_id,
+        transcript_hash=payload.transcript_hash,
+        translation_version=payload.translation_version,
+        translations=items,
+        completed=len(items),
+        total=payload.total_sentences,
+        persistent=persistent,
+    )
+
+
+async def run_translation_batch(
+    payload: TranslationBatchRequest, request: Request
+) -> TranslationCacheResponse:
+    key = translation_memory_key(
+        payload.video_id, payload.transcript_hash, payload.translation_version
+    )
+    memory: dict[int, TranslationItem] = request.app.state.translation_cache.setdefault(
+        key, {}
+    )
+    requested_indices = {sentence.sentence_index for sentence in payload.sentences}
+    if supabase_server_config():
+        try:
+            remote = await asyncio.to_thread(
+                read_supabase_translations,
+                payload.video_id,
+                payload.transcript_hash,
+                payload.translation_version,
+            )
+            memory.update({item.sentence_index: item for item in remote})
+        except requests.RequestException:
+            pass
+    missing_sentences = [
+        sentence
+        for sentence in payload.sentences
+        if sentence.sentence_index not in memory
+    ]
+    if missing_sentences:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise HTTPException(
+                status_code=503, detail="서버의 AI 번역 기능이 아직 준비되지 않았습니다."
+            )
+        translation_payload = payload.model_copy(
+            update={"sentences": missing_sentences}
+        )
+        try:
+            generated = await asyncio.to_thread(
+                translate_sentences, translation_payload, api_key
+            )
+            memory.update({item.sentence_index: item for item in generated})
+            if supabase_server_config():
+                await asyncio.to_thread(
+                    write_supabase_translations, translation_payload, generated
+                )
+        except AuthenticationError as error:
+            raise HTTPException(
+                status_code=401, detail="OpenAI API 키가 유효하지 않습니다."
+            ) from error
+        except RateLimitError as error:
+            raise HTTPException(
+                status_code=429, detail="OpenAI 사용 한도를 초과했습니다."
+            ) from error
+        except requests.RequestException as error:
+            raise HTTPException(
+                status_code=502, detail="번역은 생성했지만 Supabase 저장에 실패했습니다."
+            ) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=502, detail="문장 번역을 완료하지 못했습니다."
+            ) from error
+    response_items = [
+        memory[index] for index in sorted(requested_indices) if index in memory
+    ]
+    return TranslationCacheResponse(
+        video_id=payload.video_id,
+        transcript_hash=payload.transcript_hash,
+        translation_version=payload.translation_version,
+        translations=response_items,
+        completed=len(memory),
+        total=payload.total_sentences,
+        persistent=bool(supabase_server_config()),
+    )
+
+
+@app.post("/api/translations/batch", response_model=TranslationCacheResponse)
+async def translate_transcript_batch(
+    payload: TranslationBatchRequest, request: Request
+) -> TranslationCacheResponse:
+    return await run_translation_batch(payload, request)
+
+
+@app.post("/api/translations/lookup", response_model=TranslationCacheResponse)
+async def translate_transcript_lookup(
+    payload: TranslationBatchRequest, request: Request
+) -> TranslationCacheResponse:
+    if len(payload.sentences) != 1:
+        raise HTTPException(
+            status_code=400, detail="즉시 번역 요청에는 한 문장만 포함할 수 있습니다."
+        )
+    return await run_translation_batch(payload, request)
 
 
 @app.post("/api/episodes/analyze", response_model=AnalyzeEpisodeResponse)
