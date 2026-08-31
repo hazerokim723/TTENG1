@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEven
 import { createPortal } from 'react-dom'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
-import { Library, BillingPanel, UsageNotice, platformJson, type LessonSnapshot, type Usage } from './library'
+import { Library, BillingPanel, LearningUsageDialog, platformJson, type LessonSnapshot, type Usage } from './library'
 
 type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey' | 'my' | 'library'
 type SavedSentence = {
@@ -398,6 +398,7 @@ function App() {
   const [aiConnection, setAiConnection] = useState<'unknown' | 'checking' | 'connected' | 'error'>(() => loadStoredAIConnection() ? 'connected' : 'unknown')
   const [aiConnectionMessage, setAiConnectionMessage] = useState('')
   const [usage, setUsage] = useState<Usage | null>(null)
+  const [pendingLearningUrl, setPendingLearningUrl] = useState<string | null>(null)
   const [lesson, setLesson] = useState<LessonSnapshot | null>(null)
   const currentLesson = useRef<LessonSnapshot | null>(null)
   const runId = useRef(0)
@@ -638,9 +639,15 @@ function App() {
   }
 
   async function startLearning(input?: string) {
-    if (!authUser) { flash('AI 학습은 Google 로그인 후 이용할 수 있어요'); navigateTo('my'); return }
     const value = (input || url).trim()
     if (!extractYouTubeVideoId(value)) { setLoadError('올바른 YouTube 링크를 입력해 주세요.'); return }
+    setLoadError('')
+    setPendingLearningUrl(value)
+  }
+
+  async function beginLearning(value: string) {
+    setPendingLearningUrl(null)
+    if (!authUser) { flash('AI 학습은 Google 로그인 후 이용할 수 있어요'); navigateTo('my'); return }
     setUrl(value); setLoading(true); setLoadError('')
     analysisControllerRef.current?.abort()
     const id = ++runId.current
@@ -814,8 +821,6 @@ function App() {
           </div>
           {aiConnection === 'error' && aiConnectionMessage && <p className={`ai-connection-message ${aiConnection}`} role="status">{aiConnectionMessage}</p>}
           <div className="url-form"><input value={url} onChange={(e) => { setUrl(e.target.value); setLoadError('') }} onKeyDown={(e) => e.key === 'Enter' && !loading && startLearning()} placeholder="YouTube 링크를 붙여넣으세요" aria-label="유튜브 링크" aria-invalid={Boolean(loadError)} /><button onClick={() => void startLearning()} disabled={loading}>{loading ? <><span className="spinner" />분석 중</> : '학습 시작 →'}</button></div>
-          <div className="library-actions"><button className="text-button" onClick={() => { const id = extractYouTubeVideoId(url); if(id) playVideo({video_id: id}); else setLoadError('올바른 YouTube 링크를 입력해 주세요.') }}>영상만 재생 · 무료</button></div>
-          <UsageNotice usage={usage} />
           {loadError && <p className="url-error" role="alert">{loadError}</p>}
         </section>
 
@@ -831,6 +836,7 @@ function App() {
         </section>}
       </main>
       <footer><small>© 2026 Turtle English</small></footer>
+      {pendingLearningUrl && <LearningUsageDialog key={authUser?.id || 'guest'} signedIn={Boolean(authUser)} onClose={() => setPendingLearningUrl(null)} onLearn={() => void beginLearning(pendingLearningUrl)} onPlay={() => { const videoId = extractYouTubeVideoId(pendingLearningUrl); setPendingLearningUrl(null); if (videoId) playVideo({video_id: videoId}) }} />}
     </div>
   )
 }

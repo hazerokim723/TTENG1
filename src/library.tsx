@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { User } from '@supabase/supabase-js'
 import type { LearningItem, TranscriptBlock } from './App'
 import { supabase } from './supabase'
@@ -32,6 +33,47 @@ export async function platformJson<T>(path: string, options: RequestInit = {}): 
 export function UsageNotice({ usage }: { usage: Usage | null }) {
   if (!usage) return <p className="usage-notice">Google 로그인 후 새 영상 10개를 무료로 AI 학습할 수 있어요. 영상 재생은 누구나 가능합니다.</p>
   return <p className="usage-notice" role="status">{usage.plan === 'trial' ? `무료 AI 학습 가능 횟수가 10회 중 ${usage.remaining}회 남았습니다.` : `테스트 구독 · 이번 이용 기간의 새 영상 학습이 30개 중 ${usage.remaining}개 남았습니다.`} <small>이미 학습한 영상은 추가 차감 없이 복습해요.</small></p>
+}
+
+export function LearningUsageDialog({ signedIn, onClose, onLearn, onPlay }: {
+  signedIn: boolean; onClose: () => void; onLearn: () => void; onPlay: () => void
+}) {
+  const dialog = useRef<HTMLDialogElement>(null)
+  const [usage, setUsage] = useState<Usage | null>(null)
+  const [loading, setLoading] = useState(signedIn)
+  const [error, setError] = useState('')
+  const [attempt, setAttempt] = useState(0)
+
+  useEffect(() => {
+    const element = dialog.current
+    const previousFocus = document.activeElement as HTMLElement | null
+    element?.showModal()
+    return () => { element?.close(); previousFocus?.focus() }
+  }, [])
+
+  useEffect(() => {
+    if (!signedIn) return
+    const controller = new AbortController()
+    setLoading(true); setError('')
+    void platformJson<Usage>('/api/account/usage', { signal: controller.signal })
+      .then(data => { if (!controller.signal.aborted) setUsage(data) })
+      .catch(reason => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : '남은 횟수를 확인하지 못했어요.') })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    return () => controller.abort()
+  }, [signedIn, attempt])
+
+  return createPortal(<dialog ref={dialog} className="learning-usage-dialog" aria-labelledby="learning-usage-title" onCancel={onClose}>
+    <button type="button" className="usage-dialog-close" onClick={onClose} aria-label="학습 안내 닫기" autoFocus>×</button>
+    <span className="eyebrow">YOUR ENGLISH JOURNEY</span>
+    <h2 id="learning-usage-title">학습을 시작할까요?</h2>
+    {loading ? <p className="usage-notice" role="status">남은 AI 학습 횟수를 확인하고 있어요…</p>
+      : error ? <p className="url-error" role="alert">{error} <button type="button" className="text-button" onClick={() => setAttempt(value => value + 1)}>다시 확인</button></p>
+      : <UsageNotice usage={usage} />}
+    <div className="usage-dialog-actions">
+      <button type="button" className="usage-dialog-secondary" onClick={onPlay}>영상만 재생 · 무료</button>
+      <button type="button" className="usage-dialog-primary" onClick={onLearn} disabled={loading || Boolean(error)}>{signedIn ? '학습 시작 →' : 'Google 로그인'}</button>
+    </div>
+  </dialog>, document.body)
 }
 
 type Video = { video_id: string; title?: string; video_title?: string; channel_name?: string; description?: string; duration_sec?: number; sort_order?: number; visible?: boolean; ready?: boolean; completed?: number; total?: number; api_attempts?: number; input_chars?: number; error?: string; progress_percent?: number; last_studied_at?: string }
