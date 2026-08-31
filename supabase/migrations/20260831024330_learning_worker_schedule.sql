@@ -1,4 +1,5 @@
 -- Safe by default: no outgoing requests until the two Vault values are configured.
+-- Filename matches the applied Supabase migration history.
 create extension if not exists pg_cron;
 create extension if not exists pg_net with schema extensions;
 create function public.turtle_dispatch_workers() returns void

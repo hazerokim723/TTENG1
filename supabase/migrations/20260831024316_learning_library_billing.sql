@@ -1,4 +1,5 @@
 -- All new data is server-owned. No browser role may mutate grants or payments.
+-- Filename matches the version recorded by Supabase when applied through MCP.
 create table public.platform_admins (user_id uuid primary key references auth.users(id) on delete cascade);
 create table public.library_episodes (
  video_id text primary key check (video_id ~ '^[A-Za-z0-9_-]{11}$'),

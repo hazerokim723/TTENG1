@@ -1,4 +1,5 @@
 -- A delayed older receipt must never roll a newer subscription period backwards.
+-- Filename matches the applied Supabase migration history.
 create or replace function public.billing_fulfill(p_order uuid,p_payment text) returns void
 language plpgsql security invoker set search_path='' as $$
 declare o public.billing_orders; s public.subscriptions;
