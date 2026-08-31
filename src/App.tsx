@@ -524,7 +524,10 @@ function App() {
 
   useEffect(() => () => analysisControllerRef.current?.abort(), [])
 
-  const episodeProgress = useMemo(() => Math.min(100, Math.round((progress / 100) * 100)), [progress])
+  // Episode progress comes from this video's saved playback position, not
+  // the separate journey/quiz score. Unstudied videos start at zero.
+  const episodeProgress = Math.max(0, Math.min(100,
+    Math.round(learningProgressByVideo[episodeId]?.progress_percent || 0)))
   const dictationItems = useMemo(() => learningItems.filter((item) => item.is_dictation_target !== false), [learningItems])
 
   function persistLearningProgress(videoId: string, title: string, channel: string, duration: number, position = 0) {
