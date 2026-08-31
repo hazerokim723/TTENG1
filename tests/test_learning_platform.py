@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from backend.main import app, TranslationItem, TranslationBatchRequest
 from backend.learning_platform import Platform
 from backend.subscriptions import next_month, settings, verify_payment, charge, AMOUNT
+from backend.platform_store import config
 
 AID = 'a' * 64
 VID = 'ELI8AwyXF1Q'
@@ -20,6 +21,13 @@ UID = str(uuid4())
 
 class AccessBoundaryTests(unittest.TestCase):
     def setUp(self): self.client = TestClient(app)
+
+    def test_public_url_is_reused_but_never_public_key(self):
+        with patch.dict(os.environ,{'SUPABASE_URL':'','VITE_SUPABASE_URL':'https://example.supabase.co','SUPABASE_SERVICE_ROLE_KEY':'','VITE_SUPABASE_PUBLISHABLE_KEY':'public'}):
+            with self.assertRaises(HTTPException) as error: config()
+            self.assertIn('SUPABASE_SERVICE_ROLE_KEY',error.exception.detail)
+        with patch.dict(os.environ,{'SUPABASE_URL':'','VITE_SUPABASE_URL':'https://example.supabase.co','SUPABASE_SERVICE_ROLE_KEY':'server-test'}):
+            self.assertEqual(config(),('https://example.supabase.co','server-test'))
 
     def test_no_token_never_reaches_paid_services(self):
         requests = [('/api/learning/start', {'youtube_url': VID}),

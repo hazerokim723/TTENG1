@@ -37,6 +37,8 @@ on conflict do nothing;
 
 Production에 서버 전용 `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `SUPADATA_API_KEY`를 유지한다. 공개 Google 로그인 설정에는 기존 `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`만 사용한다. 서버 키에 `VITE_` 접두사를 붙이지 않는다.
 
+URL만 빠졌다면 기존 `VITE_SUPABASE_URL`을 서버에서도 재사용하지만, 공개 키로 Service Role을 대체하지는 않는다. 배포 후 `/api/library`가 503이라면 응답에 표시된 서버 변수를 먼저 등록해야 한다. 화면 배포 성공과 서버 설정 완료는 별개다.
+
 토스 테스트를 시작할 때 추가:
 
 - `TOSS_CLIENT_KEY`: API 개별 연동 테스트 클라이언트 키 (`test_ck_…`)

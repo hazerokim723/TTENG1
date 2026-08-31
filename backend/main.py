@@ -879,7 +879,7 @@ def word_cache_key(word: str, context: str, supplied_hash: str = "") -> str:
 
 
 def supabase_server_config() -> tuple[str, str] | None:
-    url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    url = (os.getenv("SUPABASE_URL", "").strip() or os.getenv("VITE_SUPABASE_URL", "").strip()).rstrip("/")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     if not url or not key:
         return None

@@ -10,10 +10,11 @@ from fastapi import HTTPException, Request
 
 
 def config() -> tuple[str, str]:
-    url = os.getenv('SUPABASE_URL', '').strip().rstrip('/')
+    url = (os.getenv('SUPABASE_URL', '').strip() or os.getenv('VITE_SUPABASE_URL', '').strip()).rstrip('/')
     key = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '').strip()
     if not url or not key:
-        raise HTTPException(503, '계정 학습 저장소를 준비 중입니다. 서버 Supabase 설정을 확인해 주세요.')
+        missing = ', '.join(name for name, value in [('SUPABASE_URL', url), ('SUPABASE_SERVICE_ROLE_KEY', key)] if not value)
+        raise HTTPException(503, f'서버 학습 저장소 설정이 필요합니다. Vercel Production에 {missing}를 등록한 뒤 다시 배포해 주세요.')
     return url, key
 
 
