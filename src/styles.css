@@ -459,10 +459,16 @@ main {
   line-height: 1.7;
 }
 
-.script-tip {
+.script-playback-controls {
   margin: 12px 30px 24px;
-  border-color: #edf0ed;
+  border-top: 1px solid #edf0ed;
+  padding-top: 12px;
+  display: flex;
+  justify-content: center;
 }
+.script-playback-button { display: inline-flex; align-items: center; justify-content: center; gap: 10px; min-width: 132px; min-height: 44px; padding: 10px 20px; border: 1px solid #dce5df; border-radius: 12px; background: #f2f6f3; color: #234c3b; font-weight: 700; }
+.script-playback-button:hover { background: #e7efe9; }
+.script-playback-button:disabled { opacity: .5; cursor: wait; }
 
 .wordwise {
   font-family: inherit;
@@ -614,7 +620,7 @@ footer {
   .transcript-body { padding-inline: 10px; }
   .script-line { grid-template-columns: 42px 1fr 34px; padding: 13px 5px; }
   .script-line p { font-size: 14px; line-height: 1.65; }
-  .script-tip { margin-inline: 18px; }
+  .script-playback-controls { margin-inline: 18px; }
   .selection-palette { gap: 10px; padding: 10px 12px; }
   .palette-swatch { width: 26px; height: 26px; }
 }
@@ -981,6 +987,7 @@ footer {
 .letter-slot { display: inline-flex; min-width: .56em; height: 1.08em; align-items: center; justify-content: center; font-size: .92em; }
 .letter-slot.empty { border-bottom: 1.5px solid #909692; }
 .letter-slot.filled { color: #525955; }
+.letter-slot.active { background: #e1e5e2; box-shadow: inset 2px 0 #5e6d64; }
 .letter-space { min-width: .3em; }
 
 .dictation-trigger {
@@ -1082,15 +1089,19 @@ footer {
 .word-popover {
   position: fixed;
   z-index: 45;
-  width: 240px;
+  width: min(280px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
   padding: 16px 18px 14px;
   background: #fff;
   border: 1px solid #dfe5e1;
   border-radius: 13px;
   box-shadow: 0 16px 40px rgba(26,43,34,.15);
-  transform: translate(-50%, calc(-100% - 12px));
-  animation: palette-pop .14s ease-out both;
+  animation: word-popover-in .14s ease-out;
 }
+@keyframes word-popover-in { from { opacity: 0; } to { opacity: 1; } }
+.word-lookup-retry button { padding: 7px 10px; border: 1px solid #dce5df; border-radius: 8px; background: #f2f6f3; color: #234c3b; }
 
 .word-popover > button {
   position: absolute;

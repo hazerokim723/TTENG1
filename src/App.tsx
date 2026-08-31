@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+import { createDictationSlots, hiddenDictationAnswer, normalizeDictationInput } from './dictationInput'
+import { isSelectionGesture } from './scriptInteractions'
+import { WordPopover } from './WordPopover'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 import { Library, BillingPanel, LearningUsageDialog, platformJson, type LessonSnapshot, type Usage } from './library'
@@ -923,19 +926,16 @@ function formatPlayerTime(seconds: number) {
 }
 
 function maskLearningTarget(target: string) {
-  return target.replace(/[A-Za-z]+/g, (word) => {
-    if (word.length <= 2) return word
-    const visibleCount = word.length === 3 ? 1 : 2
-    return `${word.slice(0, visibleCount)}${'_'.repeat(word.length - visibleCount)}`
-  })
+  return createDictationSlots(target).map(slot => slot.blankIndex >= 0 ? '_' : slot.character).join('')
 }
 
 function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved }: { item: LearningItem; tokenId: string; focusRequested: boolean; onSave: (word: string, details?: WordDefinition) => void; onComplete: (word: string) => void; onResolved: (tokenId: string, typed: boolean) => void }) {
   const phrase = item.target_word.trim()
-  const prefix = phrase.slice(0, 2)
+  const answer = hiddenDictationAnswer(phrase)
   const [revealed, setRevealed] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [value, setValue] = useState(prefix)
+  const [value, setValue] = useState('')
+  const [caret, setCaret] = useState(0)
   const [result, setResult] = useState<'idle' | 'correct' | 'wrong'>('idle')
   const [showGood, setShowGood] = useState(false)
   const clickTimer = useRef(0)
@@ -959,10 +959,12 @@ function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved
     onSave(phrase, { word: phrase, word_type: item.word_type, definition_kr: item.definition_kr })
   }
 
-  function updateAnswer(nextValue: string) {
+  function updateAnswer(rawValue: string, selectionStart = rawValue.length) {
+    const nextValue = normalizeDictationInput(phrase, rawValue)
     setValue(nextValue)
+    setCaret(Math.min(rawValue.slice(0, selectionStart).replace(/[^A-Za-z]/g, '').length, nextValue.length))
     setResult('idle')
-    if (nextValue.trim().toLocaleLowerCase() === phrase.toLocaleLowerCase()) {
+    if (answer.length > 0 && nextValue.toLowerCase() === answer.toLowerCase()) {
       setResult('correct')
       setRevealed(true)
       setEditing(false)
@@ -975,16 +977,16 @@ function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved
   }
 
   function checkAnswer() {
-    if (value.trim().toLocaleLowerCase() === phrase.toLocaleLowerCase()) updateAnswer(value)
+    if (value.toLowerCase() === answer.toLowerCase()) updateAnswer(value)
     else setResult('wrong')
   }
 
-  const slots = phrase.split('').map((character, index) => {
-    if (!/[A-Za-z]/.test(character)) return <span key={index} className="letter-space">{character}</span>
-    const positionInWord = phrase.slice(0, index).split(/[^A-Za-z]/).at(-1)?.length || 0
-    const initiallyVisible = positionInWord < 2
-    const entered = value[index]
-    return <span key={index} className={`letter-slot ${initiallyVisible || entered ? 'filled' : 'empty'}`}>{initiallyVisible ? character : entered || ''}</span>
+  const slots = createDictationSlots(phrase).map(({ character, letter, blankIndex }, index) => {
+    if (!letter) return <span key={index} className="letter-space">{character}</span>
+    const initiallyVisible = blankIndex < 0
+    const entered = initiallyVisible ? character : value[blankIndex]
+    const active = editing && !revealed && blankIndex === caret
+    return <span key={index} className={`letter-slot ${entered ? 'filled' : 'empty'} ${active ? 'active' : ''}`}>{entered || ''}</span>
   })
 
   return <span className={`c1-token ${revealed ? 'revealed' : ''} ${editing ? 'editing' : ''}`}>
@@ -993,7 +995,7 @@ function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved
       {revealed ? phrase : <span className="letter-slots" aria-hidden="true">{slots}</span>}
     </span>
     {editing && !revealed && <span className="c1-entry">
-      <input ref={inputRef} value={value} maxLength={phrase.length} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); reveal() }} onChange={(event) => updateAnswer(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && checkAnswer()} aria-label={`${masked} B2 또는 C1 표현 받아쓰기, 두 번 클릭하면 정답 공개`} title="철자를 입력하세요. 두 번 클릭하면 정답을 볼 수 있어요" />
+      <input ref={inputRef} value={value} autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); reveal() }} onChange={(event) => updateAnswer(event.target.value, event.target.selectionStart ?? event.target.value.length)} onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? value.length)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); checkAnswer() } else if (event.key === ' ') event.preventDefault() }} aria-label={`${masked} 받아쓰기, 보이는 글자와 공백은 빼고 빈칸의 알파벳만 입력하세요. 두 번 클릭하면 정답 공개`} title="빈칸의 알파벳만 입력하세요. 다음 단어로 자동 이동합니다. 두 번 클릭하면 정답을 볼 수 있어요" />
       {result === 'wrong' && <small>철자를 다시 확인해 보세요</small>}
     </span>}
     {revealed && <span className="c1-definition"><small>{item.level || 'C1'} · {item.word_type}</small><span>{item.definition_kr}</span></span>}
@@ -1130,6 +1132,9 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
   const translationControllerRef = useRef<AbortController | null>(null)
   const translationSlotsRef = useRef<{ active: number; waiters: Array<() => void> }>({ active: 0, waiters: [] })
   const dragGuardUntilRef = useRef(0)
+  const selectionAtPointerDown = useRef<Range | null>(null)
+  const wordLookupSequence = useRef(0)
+  const pendingWordLookup = useRef<null | { word: string; sentenceIndex: number; charOffset: number; cacheKey: string }>(null)
   const pointerStartRef = useRef({ x: 0, y: 0 })
   const onProgressRef = useRef(onProgress)
   const lastProgressSyncRef = useRef({ episodeId: '', syncedAt: 0, position: -1 })
@@ -1173,6 +1178,8 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
   useEffect(() => {
     setTranslationHash(artifactId); setTranslations({}); translationCache.current = {}
     setExpandedTranslations(new Set()); setTranslationLoading(new Set())
+    wordLookupSequence.current += 1
+    pendingWordLookup.current = null
     setWordPopover(null); setPalette(null)
   }, [artifactId])
 
@@ -1286,14 +1293,20 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
 
   function handlePointerDown(event: PointerEvent<HTMLParagraphElement>) {
     pointerStartRef.current = { x: event.clientX, y: event.clientY }
+    dragGuardUntilRef.current = 0
+    const selection = window.getSelection()
+    selectionAtPointerDown.current = selection?.rangeCount ? selection.getRangeAt(0).cloneRange() : null
     setPalette(null)
   }
 
   function finishPointerSelection(event: PointerEvent<HTMLParagraphElement>, line: number, rawText: string) {
     const movement = Math.hypot(event.clientX - pointerStartRef.current.x, event.clientY - pointerStartRef.current.y)
-    const isMouseDrag = event.pointerType === 'mouse' && movement > 4
-    const isTouchSelection = event.pointerType !== 'mouse'
-    if (!isMouseDrag && !isTouchSelection) {
+    const selection = window.getSelection()
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null
+    const previous = selectionAtPointerDown.current
+    const hasSelection = Boolean(selection && !selection.isCollapsed && selection.toString().trim() && range && event.currentTarget.contains(range.commonAncestorContainer))
+    const changed = Boolean(range && (!previous || range.startContainer !== previous.startContainer || range.startOffset !== previous.startOffset || range.endContainer !== previous.endContainer || range.endOffset !== previous.endOffset))
+    if (!isSelectionGesture(hasSelection, changed, movement)) {
       setPalette(null)
       return
     }
@@ -1317,7 +1330,7 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
   }
 
   function playFromTranscript(event: MouseEvent<HTMLDivElement>, seconds: number) {
-    if (performance.now() < dragGuardUntilRef.current) return
+    if (event.detail !== 0 && performance.now() < dragGuardUntilRef.current) return
     const target = event.target as HTMLElement
     if (target.closest('button, input, a, .hint-wrap, .wordwise')) return
     seekTo(seconds, true)
@@ -1395,7 +1408,7 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
 
   async function openWord(word: string, event: MouseEvent<HTMLElement>, context: string, charOffset: number, sentenceIndex: number) {
     event.stopPropagation()
-    if (performance.now() < dragGuardUntilRef.current) return
+    if (event.detail !== 0 && performance.now() < dragGuardUntilRef.current) return
     window.getSelection()?.removeAllRanges()
     const matchingExpressions = itemsForBlock(transcript[sentenceIndex], sentenceIndex)
       .map((item) => {
@@ -1408,7 +1421,7 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
     const analyzed = matchingExpressions[0]
     const lookupWord = analyzed?.expression || word
     const cacheKey = contextualWordKey(lookupWord, context)
-    if (wordPopover?.wordKey === cacheKey) {
+    if (wordPopover?.wordKey === cacheKey && !wordPopover.error) {
       if (wordPopover.loading) return
       if (wordPopover.saved) {
         return
@@ -1417,8 +1430,9 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
       setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, saved: true } : current)
       return
     }
-    const x = Math.max(130, Math.min(event.clientX, window.innerWidth - 130))
-    const y = Math.max(90, event.clientY - 12)
+    const anchor = event.currentTarget.getBoundingClientRect()
+    const x = event.detail === 0 ? anchor.left + anchor.width / 2 : event.clientX
+    const y = event.detail === 0 ? anchor.top : event.clientY
     const alreadySaved = savedWords.some((item) => normalizeWordKey(item) === normalizeWordKey(lookupWord))
     const analyzedDefinition: WordDefinition | null = analyzed ? {
       word: analyzed.expression,
@@ -1432,19 +1446,35 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
       example_en: analyzed.item.example_en,
       example_kr: analyzed.item.example_kr,
     } : null
-    const cached = analyzedDefinition || definitionCache.current.get(cacheKey)
+    wordLookupSequence.current += 1
+    const candidate = analyzedDefinition || definitionCache.current.get(cacheKey)
+    const cached = candidate?.definition_kr?.trim() ? candidate : null
     if (cached) return setWordPopover({ wordKey: cacheKey, x, y, loading: false, saved: alreadySaved, data: cached })
     const fallback: WordDefinition = { word: lookupWord, word_type: 'word', definition_kr: '문맥에 맞는 뜻을 불러오는 중이에요.' }
     setWordPopover({ wordKey: cacheKey, x, y, loading: true, saved: alreadySaved, data: fallback })
+    pendingWordLookup.current = { word, sentenceIndex, charOffset, cacheKey }
+    await requestWordDefinition()
+  }
+
+  async function requestWordDefinition() {
+    const query = pendingWordLookup.current
+    if (!query) return
+    const { word, sentenceIndex, charOffset, cacheKey } = query
+    const requestId = ++wordLookupSequence.current
+    setWordPopover(current => current?.wordKey === cacheKey ? { ...current, loading: true, error: undefined } : current)
     try {
+      if (!artifactId) throw new Error('이 영상의 AI 학습을 먼저 시작한 뒤 단어를 눌러 주세요.')
       const data = await platformJson<WordDefinition>('/api/learning/lookup', {
         method: 'POST', body: JSON.stringify({ artifact_id: artifactId, word, sentence_index: sentenceIndex, clicked_offset: charOffset })
       })
+      if (requestId !== wordLookupSequence.current) return
+      if (!data.word?.trim() || !data.definition_kr?.trim()) throw new Error('단어 뜻을 받지 못했어요. 다시 시도해 주세요.')
       definitionCache.current.set(cacheKey, data)
       storeWordDefinitions(definitionCache.current)
       setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, loading: false, data } : current)
     } catch (error) {
-      setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, loading: false, data: fallback, error: error instanceof Error ? error.message : '뜻을 불러오지 못했습니다.' } : current)
+      if (requestId !== wordLookupSequence.current) return
+      setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, loading: false, error: error instanceof Error ? error.message : '뜻을 불러오지 못했습니다.' } : current)
     }
   }
 
@@ -1488,19 +1518,24 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
           </div>
         })}
       </div>
-      <div className="script-tip"><span>⌁</span><p><b>Tip.</b> 블록의 빈 곳을 누르면 그 시점부터 재생해요. B2·C1 빈칸은 한 번 눌러 입력하고, 두 번 눌러 정답을 확인할 수 있어요.</p></div>
+      <div className="script-playback-controls">
+        <button type="button" className="script-playback-button" disabled={!playerReady} aria-label={playing ? '받아쓰기 영상 일시정지' : '받아쓰기 영상 재생'} onPointerDown={(event) => { if (document.activeElement instanceof HTMLInputElement && readingBodyRef.current?.contains(document.activeElement)) event.preventDefault() }} onClick={(event) => { event.stopPropagation(); togglePlayback() }}>
+          <span aria-hidden="true">{playing ? 'Ⅱ' : '▶'}</span>{playing ? '일시정지' : '재생'}
+        </button>
+      </div>
       {palette && createPortal(<div className={`selection-palette ${palette.placement}`} style={{ left: palette.x, top: palette.y }} role="toolbar" aria-label="선택한 텍스트 도구">
         <button className="selection-tool highlight-tool" onPointerDown={(event) => event.preventDefault()} onClick={colorSelection} aria-label="노란색 형광펜 적용 또는 해제">○</button>
       </div>, document.body)}
-      {wordPopover && createPortal(<aside className="word-popover" style={{ left: wordPopover.x, top: wordPopover.y }} role="status">
-        <button onClick={() => setWordPopover(null)} aria-label="단어 뜻 닫기">×</button>
+      {wordPopover && <WordPopover x={wordPopover.x} y={wordPopover.y}>
+        <button onClick={() => { wordLookupSequence.current += 1; setWordPopover(null) }} aria-label="단어 뜻 닫기">×</button>
         <b>{wordPopover.data.word}</b><small>{wordPopover.data.expression_type && wordPopover.data.expression_type !== 'vocabulary' ? `${wordPopover.data.expression_type.replace('_', ' ')} · ` : ''}{wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>
         {wordPopover.data.learner_note_kr && <p className="learner-note">헷갈리기 쉬운 점 · {wordPopover.data.learner_note_kr}</p>}
         {wordPopover.data.grammar_pattern && <code>{wordPopover.data.grammar_pattern}</code>}
         {wordPopover.data.example_en && <p className="word-example">{wordPopover.data.example_en}<br /><small>{wordPopover.data.example_kr}</small></p>}
         {wordPopover.loading && <i className="popover-loader" />}
-        <span>{wordPopover.saved ? '짐가방에 저장됨' : wordPopover.loading ? '뜻을 불러오는 중이에요' : '같은 단어를 한 번 더 누르면 저장돼요'}</span>
-      </aside>, document.body)}
+        {wordPopover.error && <div className="word-lookup-retry"><button type="button" onClick={() => void requestWordDefinition()}>뜻 다시 불러오기</button></div>}
+        <span>{wordPopover.loading ? '뜻을 불러오는 중이에요' : wordPopover.error ? '다시 시도하거나 같은 단어를 눌러 주세요' : wordPopover.saved ? '짐가방에 저장됨' : '같은 단어를 한 번 더 누르면 저장돼요'}</span>
+      </WordPopover>}
     </article>
   </div>
 }
@@ -1530,3 +1565,4 @@ function Journey({ progress }: { progress: number }) {
 }
 
 export default App
+export { Dictation }
