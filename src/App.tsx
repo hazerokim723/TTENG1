@@ -417,9 +417,8 @@ function App() {
 
   useEffect(() => { localStorage.setItem('turtle-progress', String(progress)) }, [progress])
   useEffect(() => { localStorage.setItem('turtle-highlights', JSON.stringify(highlights)) }, [highlights])
-  useEffect(() => { localStorage.setItem('turtle-vault', JSON.stringify(saved)) }, [saved])
-  useEffect(() => { localStorage.setItem('turtle-bag', JSON.stringify(bag)) }, [bag])
-  useEffect(() => { localStorage.setItem(SAVED_WORD_DETAILS_STORAGE_KEY, JSON.stringify(savedWordDetails)) }, [savedWordDetails])
+  // Personal saves are restored from the signed-in account's DB. Leave legacy
+  // guest storage untouched instead of overwriting it during login transitions.
   useEffect(() => { localStorage.setItem('turtle-completed-words', JSON.stringify(completedWords)) }, [completedWords])
 
   useEffect(() => {
