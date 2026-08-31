@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { wordPopoverPosition } from './scriptInteractions'
 
-export function WordPopover({ x, y, children }: { x: number; y: number; children: ReactNode }) {
+export function WordPopover({ x, y, compact = false, children }: { x: number; y: number; compact?: boolean; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null)
   useLayoutEffect(() => {
     const element = ref.current
@@ -19,5 +19,5 @@ export function WordPopover({ x, y, children }: { x: number; y: number; children
     window.addEventListener('resize', place)
     return () => { observer.disconnect(); window.removeEventListener('resize', place) }
   }, [x, y])
-  return createPortal(<aside ref={ref} className="word-popover" role="dialog" aria-label="단어 뜻" aria-live="polite">{children}</aside>, document.body)
+  return createPortal(<aside ref={ref} className={`word-popover${compact ? ' word-popover-compact' : ''}`} role="dialog" aria-label="단어 뜻" aria-live="polite">{children}</aside>, document.body)
 }

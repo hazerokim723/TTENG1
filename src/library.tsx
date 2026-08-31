@@ -5,7 +5,7 @@ import type { LearningItem, TranscriptBlock } from './App'
 import { supabase } from './supabase'
 
 const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
-export type Usage = { is_admin: boolean; plan: string; limit: number; remaining: number; free_remaining: number }
+export type Usage = { is_admin: boolean; plan: string; limit: number | null; remaining: number | null; free_remaining: number | null }
 export type LessonSnapshot = {
   episode_id: string; artifact_id: string; transcript_hash: string; title: string; source_name: string; duration_sec: number
   transcript: TranscriptBlock[]; learning_items: LearningItem[]; translations: Array<{ sentence_index: number; translation_kr: string }>
@@ -32,6 +32,7 @@ export async function platformJson<T>(path: string, options: RequestInit = {}): 
 
 export function UsageNotice({ usage }: { usage: Usage | null }) {
   if (!usage) return <p className="usage-notice">Google 로그인 후 새 영상 10개를 무료로 AI 학습할 수 있어요. 영상 재생은 누구나 가능합니다.</p>
+  if (usage.is_admin) return <p className="usage-notice" role="status">관리자 계정 · 횟수 제한 없이 AI 학습을 이용할 수 있어요.</p>
   return <p className="usage-notice" role="status">{usage.plan === 'trial' ? `무료 AI 학습 가능 횟수가 10회 중 ${usage.remaining}회 남았습니다.` : `테스트 구독 · 이번 이용 기간의 새 영상 학습이 30개 중 ${usage.remaining}개 남았습니다.`} <small>이미 학습한 영상은 추가 차감 없이 복습해요.</small></p>
 }
 

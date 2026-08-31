@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { createDictationSlots, hiddenDictationAnswer, normalizeDictationInput } from './dictationInput'
 import { isSelectionGesture } from './scriptInteractions'
 import { WordPopover } from './WordPopover'
+import { shortWordMeaning } from './shortWordMeaning'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
 import { Library, BillingPanel, LearningUsageDialog, platformJson, type LessonSnapshot, type Usage } from './library'
@@ -1004,7 +1005,6 @@ function C1Token({ item, tokenId, focusRequested, onSave, onComplete, onResolved
 
 function InteractiveScriptText({ text, sentenceIndex, items, highlights, completedWords, onWordClick, onSaveWord, onCompleteWord }: { text: string; sentenceIndex: number; items: LearningItem[]; highlights: Highlight[]; completedWords: string[]; onWordClick: (word: string, event: MouseEvent<HTMLElement>, charOffset: number) => void; onSaveWord: (word: string, details?: WordDefinition) => void; onCompleteWord: (word: string) => void }) {
   const [focusTokenId, setFocusTokenId] = useState('')
-  const [sentenceComplete, setSentenceComplete] = useState(false)
   const resolvedTokenIds = useRef(new Set<string>())
   const targets = useMemo(() => items
     .filter((item) => item.is_dictation_target !== false)
@@ -1020,7 +1020,6 @@ function InteractiveScriptText({ text, sentenceIndex, items, highlights, complet
   useEffect(() => {
     resolvedTokenIds.current = new Set()
     setFocusTokenId('')
-    setSentenceComplete(false)
   }, [sentenceIndex, text])
 
   function handleResolved(tokenId: string, typed: boolean) {
@@ -1029,7 +1028,6 @@ function InteractiveScriptText({ text, sentenceIndex, items, highlights, complet
     const currentPosition = targets.findIndex((target) => target.id === tokenId)
     const incomplete = (target: typeof targets[number]) => !resolvedTokenIds.current.has(target.id) && !completedWords.includes(target.expression.toLocaleLowerCase())
     const next = targets.slice(currentPosition + 1).find(incomplete) || targets.find(incomplete)
-    if (!next) setSentenceComplete(true)
     window.setTimeout(() => setFocusTokenId(next?.id || ''), 200)
   }
 
@@ -1077,7 +1075,7 @@ function InteractiveScriptText({ text, sentenceIndex, items, highlights, complet
     cursor = Math.max(cursor, mark.end)
   })
   if (cursor < text.length) nodes.push(...renderSegment(text.slice(cursor), cursor, `plain-${cursor}`))
-  return <>{nodes}{sentenceComplete && <span className="dictation-sentence-complete" role="status" aria-label="문장 받아쓰기 완료">✓</span>}</>
+  return <>{nodes}</>
 }
 
 type DictationProps = {
@@ -1128,6 +1126,8 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
   const playerHostRef = useRef<HTMLDivElement | null>(null)
   const playerRef = useRef<YouTubePlayerInstance | null>(null)
   const definitionCache = useRef(loadStoredWordDefinitions())
+  const definitionPrefetch = useRef<null | { key: string; promise: Promise<void> }>(null)
+  const preparedDefinitions = useRef(new Set<string>())
   const translationCache = useRef<Record<number, string>>({})
   const translationControllerRef = useRef<AbortController | null>(null)
   const translationSlotsRef = useRef<{ active: number; waiters: Array<() => void> }>({ active: 0, waiters: [] })
@@ -1182,6 +1182,35 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
     pendingWordLookup.current = null
     setWordPopover(null); setPalette(null)
   }, [artifactId])
+
+  const definitionSentence = playing ? currentIndex : visibleLineIndex
+  useEffect(() => {
+    const context = transcript[definitionSentence]?.text
+    if (!artifactId || !context) return
+    const key = `${artifactId}:${definitionSentence}`
+    if (preparedDefinitions.current.has(key)) return
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      // Only one visible-sentence request at a time, including while scrolling.
+      await definitionPrefetch.current?.promise.catch(() => {})
+      if (cancelled || preparedDefinitions.current.has(key)) return
+      const promise = platformJson<{ definitions: Array<{ lookup_word: string; definition: WordDefinition }> }>('/api/learning/definitions', {
+        method: 'POST', body: JSON.stringify({ artifact_id: artifactId, sentence_index: definitionSentence }),
+      }).then(result => {
+        for (const entry of result.definitions) {
+          if (entry.definition?.definition_kr?.trim()) {
+            definitionCache.current.set(contextualWordKey(entry.lookup_word, context), entry.definition)
+          }
+        }
+        storeWordDefinitions(definitionCache.current)
+        preparedDefinitions.current.add(key)
+      })
+      definitionPrefetch.current = { key, promise }
+      try { await promise } catch { /* A click still has the normal lookup/retry path. */ }
+      finally { if (definitionPrefetch.current?.promise === promise) definitionPrefetch.current = null }
+    }, 600)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [artifactId, definitionSentence, transcript])
 
   useEffect(() => {
     const values = Object.fromEntries(serverTranslations.map(item => [item.sentence_index, item.translation_kr]))
@@ -1464,7 +1493,10 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
     setWordPopover(current => current?.wordKey === cacheKey ? { ...current, loading: true, error: undefined } : current)
     try {
       if (!artifactId) throw new Error('이 영상의 AI 학습을 먼저 시작한 뒤 단어를 눌러 주세요.')
-      const data = await platformJson<WordDefinition>('/api/learning/lookup', {
+      const pending = definitionPrefetch.current
+      if (pending?.key === `${artifactId}:${sentenceIndex}`) await pending.promise.catch(() => {})
+      if (requestId !== wordLookupSequence.current) return
+      const data = definitionCache.current.get(cacheKey) || await platformJson<WordDefinition>('/api/learning/lookup', {
         method: 'POST', body: JSON.stringify({ artifact_id: artifactId, word, sentence_index: sentenceIndex, clicked_offset: charOffset })
       })
       if (requestId !== wordLookupSequence.current) return
@@ -1526,15 +1558,20 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
       {palette && createPortal(<div className={`selection-palette ${palette.placement}`} style={{ left: palette.x, top: palette.y }} role="toolbar" aria-label="선택한 텍스트 도구">
         <button className="selection-tool highlight-tool" onPointerDown={(event) => event.preventDefault()} onClick={colorSelection} aria-label="노란색 형광펜 적용 또는 해제">○</button>
       </div>, document.body)}
-      {wordPopover && <WordPopover x={wordPopover.x} y={wordPopover.y}>
+      {wordPopover && <WordPopover x={wordPopover.x} y={wordPopover.y} compact={!wordPopover.data.expression_type || wordPopover.data.expression_type === 'vocabulary'}>
         <button onClick={() => { wordLookupSequence.current += 1; setWordPopover(null) }} aria-label="단어 뜻 닫기">×</button>
-        <b>{wordPopover.data.word}</b><small>{wordPopover.data.expression_type && wordPopover.data.expression_type !== 'vocabulary' ? `${wordPopover.data.expression_type.replace('_', ' ')} · ` : ''}{wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>
+        {!wordPopover.data.expression_type || wordPopover.data.expression_type === 'vocabulary' ? <>
+          <div className="word-brief"><small>{wordPopover.loading ? '' : wordPopover.data.word_type}</small><span>{wordPopover.error || (wordPopover.loading ? '뜻 준비 중…' : shortWordMeaning(wordPopover.data.definition_kr))}</span></div>
+          {!wordPopover.loading && !wordPopover.error && wordPopover.saved && <small className="word-brief-saved">저장됨</small>}
+        </> : <>
+        <b>{wordPopover.data.word}</b><small>{wordPopover.data.expression_type.replace('_', ' ')} · {wordPopover.data.word_type}</small><p>{wordPopover.error || wordPopover.data.definition_kr}</p>
         {wordPopover.data.learner_note_kr && <p className="learner-note">헷갈리기 쉬운 점 · {wordPopover.data.learner_note_kr}</p>}
         {wordPopover.data.grammar_pattern && <code>{wordPopover.data.grammar_pattern}</code>}
         {wordPopover.data.example_en && <p className="word-example">{wordPopover.data.example_en}<br /><small>{wordPopover.data.example_kr}</small></p>}
+        <span>{wordPopover.loading ? '뜻을 불러오는 중이에요' : wordPopover.error ? '다시 시도하거나 같은 단어를 눌러 주세요' : wordPopover.saved ? '짐가방에 저장됨' : '같은 단어를 한 번 더 누르면 저장돼요'}</span>
+        </>}
         {wordPopover.loading && <i className="popover-loader" />}
         {wordPopover.error && <div className="word-lookup-retry"><button type="button" onClick={() => void requestWordDefinition()}>뜻 다시 불러오기</button></div>}
-        <span>{wordPopover.loading ? '뜻을 불러오는 중이에요' : wordPopover.error ? '다시 시도하거나 같은 단어를 눌러 주세요' : wordPopover.saved ? '짐가방에 저장됨' : '같은 단어를 한 번 더 누르면 저장돼요'}</span>
       </WordPopover>}
     </article>
   </div>

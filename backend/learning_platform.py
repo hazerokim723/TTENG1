@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .platform_store import admin, db, is_admin, rows, rpc, upsert, user
+from .quick_definitions import quick_meanings, sentence_words
 
 
 def utcnow():
@@ -37,6 +38,10 @@ class LookupRequest(WorkRequest):
     word: str = Field(min_length=1, max_length=80)
     sentence_index: int = Field(ge=0)
     clicked_offset: int = Field(ge=0)
+
+
+class DefinitionsRequest(WorkRequest):
+    sentence_index: int = Field(ge=0)
 
 
 class CuratedRequest(StartRequest):
@@ -153,6 +158,8 @@ class Platform:
                 'work': [{'kind': c['kind'], 'first_sentence': c['first_sentence'], 'status': c['status']} for c in chunks]}
 
     def complete_access(self, uid, artifact):
+        if is_admin(uid):
+            return
         if rows('artifact_chunks', artifact_id=f'eq.{artifact["id"]}', kind='eq.analysis', status='eq.complete', limit='1'):
             rpc('learning_finish', p_user=uid, p_video=artifact['video_id'], p_artifact=artifact['id'], p_success=True)
 
@@ -197,6 +204,8 @@ class Platform:
             raise HTTPException(502, message) from exc
 
     def usage(self, uid):
+        if is_admin(uid):
+            return {'is_admin': True, 'plan': 'admin', 'limit': None, 'remaining': None, 'free_remaining': None}
         records = []
         offset = 0
         while True:
@@ -269,13 +278,15 @@ def install(app, engine):
     @router.post('/learning/start')
     def start(payload: StartRequest, request: Request):
         uid=user(request)['id']; vid=service.video(payload.youtube_url)
-        reservation=rpc('learning_reserve',p_user=uid,p_video=vid)
+        administrator = is_admin(uid)
+        reservation = {} if administrator else rpc('learning_reserve',p_user=uid,p_video=vid)
         try:
             published=rows('curated_videos',video_id=f'eq.{vid}',visible='eq.true',limit='1')
             aid=reservation.get('artifact_id') or (published[0].get('published_artifact_id') if published else None)
             artifact=service.artifact(aid) if aid else service.ensure_artifact(vid)
             # Legacy rights are pinned once too; no retroactive charge for existing videos.
-            rpc('learning_bind', p_user=uid, p_video=vid, p_artifact=artifact['id'])
+            if not administrator:
+                rpc('learning_bind', p_user=uid, p_video=vid, p_artifact=artifact['id'])
             db('artifact_chunks','PATCH',params={'artifact_id':f'eq.{artifact["id"]}','status':'eq.failed','updated_at':f'lt.{(utcnow() - timedelta(minutes=5)).isoformat()}'},body={'attempts':0,'status':'pending'})
             service.complete_access(uid,artifact)
             response=service.snapshot(artifact)
@@ -287,7 +298,7 @@ def install(app, engine):
             response['usage']=service.usage(uid)
             return response
         except HTTPException as exc:
-            if exc.status_code != 409:
+            if not administrator and exc.status_code != 409:
                 rpc('learning_finish',p_user=uid,p_video=vid,p_artifact=None,p_success=False)
             raise
 
@@ -324,9 +335,36 @@ def install(app, engine):
         if not service.can_generate(uid,artifact,access): raise HTTPException(403,'저장된 뜻은 계속 복습할 수 있어요. 새로운 AI 해설은 구독이 필요합니다.')
         token=str(uuid4()); lock=f'lookup:{uid}'
         if not rpc('platform_claim_lock',p_name=lock,p_token=token,p_seconds=2): raise HTTPException(429,'잠시 후 다른 단어를 선택해 주세요.')
-        value=engine.define_word(payload.word,context,offset,os.environ.get('OPENAI_API_KEY','')).model_dump(by_alias=True)
+        try:
+            meanings = quick_meanings([(payload.word, offset)], context, engine.OPENAI_LOOKUP_MODEL, os.environ.get('OPENAI_API_KEY', ''))
+            value = meanings.get(payload.word.casefold())
+            if not value: raise HTTPException(502, '단어 뜻을 받지 못했어요. 다시 눌러 주세요.')
+        finally:
+            db('platform_locks', 'DELETE', params={'name': f'eq.{lock}', 'token': f'eq.{token}'})
         upsert('context_definitions',{'artifact_id':artifact['id'],'sentence_index':payload.sentence_index,'word_key':payload.word.casefold(),'definition':value},'artifact_id,sentence_index,word_key')
         return value
+
+    @router.post('/learning/definitions')
+    def definitions(payload: DefinitionsRequest, request: Request):
+        uid = user(request)['id']; artifact = service.artifact(payload.artifact_id)
+        access = service.access(uid, artifact)
+        if payload.sentence_index >= len(artifact['transcript']):
+            raise HTTPException(400, '문장 번호가 올바르지 않습니다.')
+        context = artifact['transcript'][payload.sentence_index]['text']
+        cached = {row['word_key']: row['definition'] for row in rows('context_definitions', artifact_id=f'eq.{artifact["id"]}', sentence_index=f'eq.{payload.sentence_index}')}
+        missing = [(word, offset) for word, offset in sentence_words(context) if word.casefold() not in cached]
+        if missing and service.can_generate(uid, artifact, access):
+            token = str(uuid4()); lock = f'definitions:{uid}'
+            if not rpc('platform_claim_lock', p_name=lock, p_token=token, p_seconds=60):
+                raise HTTPException(429, '다른 문장의 뜻을 준비하고 있어요.')
+            try:
+                generated = quick_meanings(missing, context, engine.OPENAI_LOOKUP_MODEL, os.environ.get('OPENAI_API_KEY', ''))
+                if generated:
+                    upsert('context_definitions', [{'artifact_id': artifact['id'], 'sentence_index': payload.sentence_index, 'word_key': word, 'definition': value} for word, value in generated.items()], 'artifact_id,sentence_index,word_key')
+                    cached.update(generated)
+            finally:
+                db('platform_locks', 'DELETE', params={'name': f'eq.{lock}', 'token': f'eq.{token}'})
+        return {'definitions': [{'lookup_word': word, 'definition': value} for word, value in cached.items()]}
 
     @router.get('/admin/library')
     def admin_library(request: Request):
