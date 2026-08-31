@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEven
 import { createPortal } from 'react-dom'
 import type { User } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './supabase'
+import { Library, BillingPanel, UsageNotice, platformJson, type LessonSnapshot, type Usage } from './library'
 
-type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey' | 'my'
+type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey' | 'my' | 'library'
 type SavedSentence = {
   id: number | string
   remoteId?: number
@@ -17,7 +18,7 @@ type SavedSentence = {
 }
 type HighlightColor = 'yellow'
 type Highlight = { id: number; line: number; start: number; end: number; color: HighlightColor; text: string }
-type LearningItem = {
+export type LearningItem = {
   timestamp_sec: number
   timestamp_display: string
   full_sentence_original: string
@@ -42,7 +43,7 @@ type LearningItem = {
   end_char?: number
   is_dictation_target?: boolean
 }
-type TranscriptBlock = { timestamp_sec: number; end_sec: number; timestamp_display: string; text: string }
+export type TranscriptBlock = { timestamp_sec: number; end_sec: number; timestamp_display: string; text: string }
 type WordDefinition = {
   word: string
   word_type: string
@@ -144,6 +145,7 @@ function loadYouTubeApi() {
 }
 
 const tabs: { id: Tab; label: string }[] = [
+  { id: 'library', label: '재생목록' },
   { id: 'dictation', label: '받아쓰기' },
   { id: 'quiz', label: '단어 퀴즈' },
   { id: 'bag', label: '짐가방' },
@@ -344,6 +346,7 @@ async function readApiJson<T>(response: Response): Promise<T | ApiErrorResponse 
 
 function MenuIcon({ id }: { id: Tab }) {
   const paths: Record<Tab, ReactNode> = {
+    library: <><path d="M4 5h16M4 10h16M4 15h9M4 20h9"/><path d="m17 14 4 3-4 3z"/></>,
     dictation: <><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h5M8 16h7"/></>,
     quiz: <><circle cx="12" cy="12" r="8"/><path d="M9.8 9a2.3 2.3 0 0 1 4.4 1c0 1.8-2.2 2-2.2 3.5M12 17h.01"/></>,
     bag: <><path d="M6 8h12l1 12H5L6 8z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></>,
@@ -365,7 +368,7 @@ function Hint({ item }: { item: LearningItem }) {
 }
 
 function App() {
-  const [tab, setTab] = useState<Tab>(() => new URLSearchParams(window.location.search).get('view') === 'my' ? 'my' : 'dictation')
+  const [tab, setTab] = useState<Tab>(() => new URLSearchParams(window.location.search).get('view') === 'my' ? 'my' : new URLSearchParams(window.location.search).get('view') === 'library' ? 'library' : 'dictation')
   const [url, setUrl] = useState('https://youtu.be/ELI8AwyXF1Q')
   const [loaded, setLoaded] = useState(true)
   const [loading, setLoading] = useState(false)
@@ -374,16 +377,16 @@ function App() {
   const [episodeTitle, setEpisodeTitle] = useState('Who Owns the Past?')
   const [sourceName, setSourceName] = useState('Freakonomics Radio')
   const [durationSec, setDurationSec] = useState(294)
-  const [transcript, setTranscript] = useState<TranscriptBlock[]>(sampleTranscript)
-  const [learningItems, setLearningItems] = useState<LearningItem[]>(sampleItems)
+  const [transcript, setTranscript] = useState<TranscriptBlock[]>([])
+  const [learningItems, setLearningItems] = useState<LearningItem[]>([])
   const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus>('complete')
   const [analysisProgress, setAnalysisProgress] = useState({ completed: 1, total: 1 })
   const [playing, setPlaying] = useState(false)
   const [progress, setProgress] = useState(() => Number(localStorage.getItem('turtle-progress')) || 42)
   const [highlights, setHighlights] = useState<Highlight[]>(() => JSON.parse(localStorage.getItem('turtle-highlights') || '[]'))
-  const [saved, setSaved] = useState<SavedSentence[]>(() => JSON.parse(localStorage.getItem('turtle-vault') || '[]'))
-  const [bag, setBag] = useState<string[]>(() => JSON.parse(localStorage.getItem('turtle-bag') || '["provenance"]'))
-  const [savedWordDetails, setSavedWordDetails] = useState<SavedWordDetails>(() => JSON.parse(localStorage.getItem(SAVED_WORD_DETAILS_STORAGE_KEY) || '{}'))
+  const [saved, setSaved] = useState<SavedSentence[]>([])
+  const [bag, setBag] = useState<string[]>([])
+  const [savedWordDetails, setSavedWordDetails] = useState<SavedWordDetails>({})
   const [completedWords, setCompletedWords] = useState<string[]>(() => JSON.parse(localStorage.getItem('turtle-completed-words') || '[]'))
   const [answer, setAnswer] = useState('')
   const [quizState, setQuizState] = useState<'idle' | 'correct' | 'wrong'>('idle')
@@ -394,13 +397,19 @@ function App() {
   const [learningProgressByVideo, setLearningProgressByVideo] = useState<Record<string, LearningProgressRecord>>({})
   const [aiConnection, setAiConnection] = useState<'unknown' | 'checking' | 'connected' | 'error'>(() => loadStoredAIConnection() ? 'connected' : 'unknown')
   const [aiConnectionMessage, setAiConnectionMessage] = useState('')
+  const [usage, setUsage] = useState<Usage | null>(null)
+  const [lesson, setLesson] = useState<LessonSnapshot | null>(null)
+  const currentLesson = useRef<LessonSnapshot | null>(null)
+  const runId = useRef(0)
+  const nearSentence = useRef(0)
+  const workSlots = useRef(0)
   const analysisControllerRef = useRef<AbortController | null>(null)
   const previousAuthUserIdRef = useRef<string | null>(null)
 
   function navigateTo(nextTab: Tab) {
     setTab(nextTab)
     const nextUrl = new URL(window.location.href)
-    if (nextTab === 'my') nextUrl.searchParams.set('view', 'my')
+    if (nextTab === 'my' || nextTab === 'library') nextUrl.searchParams.set('view', nextTab)
     else nextUrl.searchParams.delete('view')
     nextUrl.searchParams.delete('code')
     window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`)
@@ -489,7 +498,14 @@ function App() {
     if (authLoading) return
     const previousUserId = previousAuthUserIdRef.current
     const nextUserId = authUser?.id || null
-    if (previousUserId && !nextUserId) {
+    if (previousUserId !== nextUserId) {
+      runId.current += 1
+      analysisControllerRef.current?.abort()
+      currentLesson.current = null
+      setLesson(null); setTranscript([]); setLearningItems([]); setPlaying(false)
+      setHighlights([]); setCompletedWords([]); setUsage(null)
+    }
+    if (previousUserId && previousUserId !== nextUserId) {
       setBag([])
       setSavedWordDetails({})
       setSaved([])
@@ -497,6 +513,14 @@ function App() {
     }
     previousAuthUserIdRef.current = nextUserId
   }, [authLoading, authUser])
+
+  useEffect(() => {
+    let active = true
+    if (!authUser) { setUsage(null); return }
+    void platformJson<Usage>('/api/account/usage').then(data => { if(active) setUsage(data) })
+      .catch(error => { if(active) setLoadError(error.message) })
+    return () => { active = false }
+  }, [authUser?.id])
 
   useEffect(() => () => analysisControllerRef.current?.abort(), [])
 
@@ -532,160 +556,125 @@ function App() {
     })
   }
 
+  async function refreshUsage() {
+    if (!authUser) return
+    try { setUsage(await platformJson<Usage>('/api/account/usage')) } catch { /* Preserve the last confirmed quota. */ }
+  }
+
   async function checkOpenAIConnection() {
-    setAiConnection('checking')
-    setAiConnectionMessage('')
+    if (!authUser) { navigateTo('my'); return }
+    setAiConnection('checking'); setAiConnectionMessage('')
     try {
-      const response = await fetch(`${API_BASE_URL}/api/openai/validate`, { method: 'POST' })
-      const data = await readApiJson<OpenAIConnectionResponse>(response)
-      if (!response.ok) throw new Error((data && 'detail' in data && data.detail) || 'OpenAI 연결 확인에 실패했습니다.')
-      if (!data || !('status' in data) || data.status !== 'connected') throw new Error('OpenAI 연결 결과를 확인하지 못했습니다.')
-
-      localStorage.setItem(AI_CONNECTION_STORAGE_KEY, JSON.stringify(data))
+      await platformJson('/api/account/connection', {method: 'POST'})
+      setUsage(await platformJson<Usage>('/api/account/usage'))
       setAiConnection('connected')
-      setAiConnectionMessage('')
-      flash('OpenAI 연결을 확인했어요')
     } catch (error) {
-      localStorage.removeItem(AI_CONNECTION_STORAGE_KEY)
       setAiConnection('error')
-      setAiConnectionMessage(error instanceof Error ? error.message : 'OpenAI 연결 확인 중 오류가 발생했습니다.')
+      setAiConnectionMessage(error instanceof Error ? error.message : '서버 연결을 확인해 주세요.')
     }
   }
 
-  async function runProgressiveAnalysis(data: AnalyzeResponse) {
-    const chunks = chunkTranscriptBlocks(data.transcript)
-    if (!chunks.length) return
-    analysisControllerRef.current?.abort()
-    const controller = new AbortController()
-    analysisControllerRef.current = controller
-    setAnalysisStatus('running')
-    setAnalysisProgress({ completed: 0, total: chunks.length })
-    let cursor = 0
-    let completed = 0
-    let collected = [...data.learning_items]
-
-    const worker = async () => {
-      while (!controller.signal.aborted) {
-        const chunkIndex = cursor++
-        if (chunkIndex >= chunks.length) return
-        const response = await fetch(`${API_BASE_URL}/api/episodes/analyze-chunk`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            episode_id: data.episode_id,
-            chunk_index: chunkIndex,
-            total_chunks: chunks.length,
-            transcript_chunk: chunks[chunkIndex],
-          }),
-          signal: controller.signal,
-        })
-        const result = await readApiJson<AnalyzeChunkResponse>(response)
-        if (!response.ok || !result || !('learning_items' in result)) {
-          throw new Error((result && 'detail' in result && result.detail) || '학습 단어 분석에 실패했습니다.')
-        }
-        collected = mergeLearningItems(collected, result.learning_items)
-        completed += 1
-        setLearningItems([...collected])
-        setAnalysisProgress({ completed, total: chunks.length })
-      }
-    }
-
-    try {
-      await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => worker()))
-      if (controller.signal.aborted) return
-      setAnalysisStatus('complete')
-      storeEpisodeAnalysisCache(data, collected)
-      flash(`B2·C1 학습 표현 ${collected.length}개를 준비했어요`)
-    } catch (error) {
-      if (controller.signal.aborted) return
-      setAnalysisStatus('error')
-      setLoadError(error instanceof Error ? error.message : '학습 단어 분석에 실패했습니다.')
-    }
-  }
-
-  async function startLearning() {
-    const value = url.trim()
-    const isYouTubeUrl = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?(.*&)?v=|shorts\/|embed\/)|youtu\.be\/)[\w-]{6,}/i.test(value)
-    if (!isYouTubeUrl) {
-      setLoadError('올바른 YouTube 영상 링크를 입력해 주세요.')
-      return
-    }
-    setLoading(true)
-    setLoadError('')
-    try {
-      const videoId = extractYouTubeVideoId(value)
-      const browserCache = videoId ? loadEpisodeAnalysisCache(videoId) : null
-      if (browserCache) {
-        analysisControllerRef.current?.abort()
-        setEpisodeId(browserCache.episode_id)
-        setEpisodeTitle(browserCache.title)
-        setSourceName(browserCache.source_name)
-        setDurationSec(browserCache.duration_sec)
-        setTranscript(browserCache.transcript)
-        setLearningItems(browserCache.learning_items)
-        setAnalysisStatus('complete')
-        setAnalysisProgress({ completed: 1, total: 1 })
-        setLoaded(true)
-        navigateTo('dictation')
-        persistLearningProgress(browserCache.episode_id, browserCache.title, browserCache.source_name, browserCache.duration_sec, learningProgressByVideo[browserCache.episode_id]?.last_position_sec || 0)
-        flash('저장된 분석 결과를 바로 불러왔어요')
-        return
-      }
-      const response = await fetch(`${API_BASE_URL}/api/episodes/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ youtube_url: value }),
-      })
-      const data = await readApiJson<AnalyzeResponse>(response)
-      if (!response.ok) throw new Error((data && 'detail' in data && data.detail) || '영상 분석에 실패했습니다.')
-      if (!data || !('transcript' in data) || !Array.isArray(data.transcript) || data.transcript.length === 0) {
-        throw new Error('이 영상에서 학습할 자막을 찾지 못했습니다.')
-      }
-      setEpisodeId(data.episode_id)
-      setEpisodeTitle(data.title)
-      setSourceName(data.source_name)
-      setDurationSec(data.duration_sec)
-      setTranscript(data.transcript)
-      setLearningItems(data.learning_items)
-      setAnalysisStatus(data.analysis_status)
-      setAnalysisProgress({ completed: data.completed_chunks, total: data.total_chunks })
-      setHighlights([])
-      setAnswer('')
-      setQuizState('idle')
-      setQuizIndex(0)
-      setLoading(false)
-      setLoaded(true)
-      navigateTo('dictation')
+  function updateLesson(data: LessonSnapshot, initial = false) {
+    const previous = currentLesson.current
+    if (!initial && previous?.artifact_id !== data.artifact_id) return
+    const translations = new Map<number, TranslationItem>()
+    if (!initial) previous?.translations.forEach(item => translations.set(item.sentence_index, item))
+    data.translations.forEach(item => translations.set(item.sentence_index, item))
+    const next = { ...data, learning_items: initial ? data.learning_items : mergeLearningItems(previous?.learning_items || [], data.learning_items),
+      translations: [...translations.values()], completed_chunks: Math.max(initial ? 0 : previous?.completed_chunks || 0, data.completed_chunks) }
+    currentLesson.current = next; setLesson(next); setLearningItems(next.learning_items)
+    setAnalysisStatus(next.analysis_status); setAnalysisProgress({ completed: next.completed_chunks, total: next.total_chunks })
+    if (data.usage) setUsage(data.usage)
+    if (initial) {
+      setEpisodeId(data.episode_id); setEpisodeTitle(data.title); setSourceName(data.source_name); setDurationSec(data.duration_sec)
+      setTranscript(data.transcript); setHighlights([]); setCompletedWords([]); setAnswer(''); setQuizState('idle'); setQuizIndex(0)
+      setLoaded(true); navigateTo('dictation'); setAiConnection('connected')
       persistLearningProgress(data.episode_id, data.title, data.source_name, data.duration_sec, learningProgressByVideo[data.episode_id]?.last_position_sec || 0)
-      if (data.analysis_status === 'complete') {
-        storeEpisodeAnalysisCache(data, data.learning_items)
-        flash(`B2·C1 학습 표현 ${data.learning_items.length}개를 준비했어요`)
-      } else {
-        flash('전체 스크립트를 먼저 준비했어요')
-        if (data.analysis_status === 'pending') void runProgressiveAnalysis(data)
-      }
-    } catch (error) {
-      const message = error instanceof TypeError
-        ? '분석 서버에 연결할 수 없습니다. 백엔드가 실행 중인지 확인해 주세요.'
-        : error instanceof Error ? error.message : '영상 분석 중 오류가 발생했습니다.'
-      setLoadError(message)
-      const failedVideoId = extractYouTubeVideoId(value)
-      if (failedVideoId && message.includes('자막')) {
-        analysisControllerRef.current?.abort()
-        setEpisodeId(failedVideoId)
-        setEpisodeTitle('YouTube 영상')
-        setSourceName('YouTube · 사용할 수 있는 영어 자막 없음')
-        setDurationSec(0)
-        setTranscript([])
-        setLearningItems([])
-        setAnalysisStatus('error')
-        setAnalysisProgress({ completed: 0, total: 0 })
-        setLoaded(true)
-        navigateTo('dictation')
-      }
-    } finally {
-      setLoading(false)
     }
+  }
+
+  async function workRequest(artifactId: string, kind: string, near: number, signal?: AbortSignal) {
+    while (workSlots.current >= 2) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+      await new Promise(resolve => window.setTimeout(resolve, 80))
+    }
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    workSlots.current += 1
+    try {
+      return await platformJson<LessonSnapshot>('/api/learning/work', { method: 'POST', body: JSON.stringify({artifact_id: artifactId, kind, near}), signal })
+    } finally { workSlots.current -= 1 }
+  }
+
+  async function runProgressiveAnalysis(data: LessonSnapshot) {
+    analysisControllerRef.current?.abort()
+    const controller = new AbortController(); analysisControllerRef.current = controller
+    const id = ++runId.current
+    const worker = async () => {
+      while (!controller.signal.aborted && id === runId.current) {
+        const current = currentLesson.current
+        if (!current || current.ready || current.can_generate === false) return
+        const pending = current.work.filter(item => item.status !== 'complete')
+          .sort((a,b) => (current.completed_chunks === 0 ? Number(b.kind === 'analysis') - Number(a.kind === 'analysis') : 0)
+            || Math.abs(a.first_sentence-nearSentence.current)-Math.abs(b.first_sentence-nearSentence.current))
+        if (!pending.length) return
+        const result = await workRequest(data.artifact_id, pending[0].kind, nearSentence.current, controller.signal)
+        if (id !== runId.current || controller.signal.aborted) return
+        updateLesson(result); void refreshUsage()
+        if (result.error) throw new Error(result.error)
+        await new Promise(resolve => window.setTimeout(resolve, 500))
+      }
+    }
+    try { await Promise.all([worker(), worker()]) }
+    catch (error) {
+      if (id !== runId.current || controller.signal.aborted) return
+      controller.abort(); setAnalysisStatus('error')
+      setLoadError((error instanceof Error ? error.message : '자료 준비가 일시 중단되었습니다.') + ' 같은 영상의 학습 시작을 다시 누르면 저장된 지점부터 이어집니다.')
+      void refreshUsage()
+    }
+  }
+
+  function acceptPrepared(data: LessonSnapshot) {
+    updateLesson(data, true)
+    if (!data.ready && data.can_generate !== false) void runProgressiveAnalysis(data)
+  }
+
+  async function startLearning(input?: string) {
+    if (!authUser) { flash('AI 학습은 Google 로그인 후 이용할 수 있어요'); navigateTo('my'); return }
+    const value = (input || url).trim()
+    if (!extractYouTubeVideoId(value)) { setLoadError('올바른 YouTube 링크를 입력해 주세요.'); return }
+    setUrl(value); setLoading(true); setLoadError('')
+    analysisControllerRef.current?.abort()
+    const id = ++runId.current
+    try {
+      const data = await platformJson<LessonSnapshot>('/api/learning/start', { method: 'POST', body: JSON.stringify({youtube_url: value}) })
+      if (id !== runId.current) return
+      acceptPrepared(data)
+      flash(data.cached ? '저장된 학습 자료를 불러왔어요' : '전체 스크립트를 먼저 준비했어요')
+    } catch (error) {
+      if (id === runId.current) setLoadError(error instanceof Error ? error.message : '학습 자료 준비에 실패했습니다.')
+    } finally { setLoading(false) }
+  }
+
+  function playVideo(video: { video_id: string; title?: string; video_title?: string; channel_name?: string; duration_sec?: number }) {
+    analysisControllerRef.current?.abort(); runId.current += 1; currentLesson.current = null; setLesson(null)
+    const id = runId.current
+    setTranscript([]); setLearningItems([]); setHighlights([]); setAnalysisStatus('complete'); setLoadError('')
+    setEpisodeId(video.video_id); setEpisodeTitle(video.title || video.video_title || 'YouTube 영상')
+    setSourceName(video.channel_name || 'YouTube'); setDurationSec(video.duration_sec || 0); setUrl('https://youtu.be/' + video.video_id)
+    setLoaded(true); navigateTo('dictation')
+    if (!video.title && !video.video_title) {
+      void platformJson<{title: string; channel_name: string}>('/api/library/video/' + video.video_id)
+        .then(info => { if (runId.current === id) { setEpisodeTitle(info.title); setSourceName(info.channel_name) } })
+        .catch(() => { /* Metadata failure never blocks free YouTube playback. */ })
+    }
+  }
+
+  async function prioritizeTranslation(index: number) {
+    const current = currentLesson.current
+    if (!current) return
+    nearSentence.current = index
+    const response = await workRequest(current.artifact_id, 'translation', index, analysisControllerRef.current?.signal)
+    updateLesson(response)
   }
 
   function flash(message: string) {
@@ -702,6 +691,7 @@ function App() {
   }
 
   function saveSentence(block: TranscriptBlock) {
+    if (!authUser) { navigateTo('my'); flash('문장 저장은 로그인 후 이용해 주세요'); return }
     const sentence: SavedSentence = {
       id: Date.now(),
       time: block.timestamp_display,
@@ -742,6 +732,7 @@ function App() {
   }
 
   function saveWord(word: string, details?: WordDefinition) {
+    if (!authUser) { navigateTo('my'); flash('단어 저장은 로그인 후 이용해 주세요'); return }
     const normalized = normalizeWordKey(word)
     if (!normalized) return
     const definition = details || savedWordDetails[normalized]
@@ -823,17 +814,21 @@ function App() {
             </button>
           </div>
           {aiConnection === 'error' && aiConnectionMessage && <p className={`ai-connection-message ${aiConnection}`} role="status">{aiConnectionMessage}</p>}
-          <div className="url-form"><input value={url} onChange={(e) => { setUrl(e.target.value); setLoadError('') }} onKeyDown={(e) => e.key === 'Enter' && !loading && startLearning()} placeholder="YouTube 링크를 붙여넣으세요" aria-label="유튜브 링크" aria-invalid={Boolean(loadError)} /><button onClick={startLearning} disabled={loading}>{loading ? <><span className="spinner" />분석 중</> : '학습 시작 →'}</button></div>
+          <div className="url-form"><input value={url} onChange={(e) => { setUrl(e.target.value); setLoadError('') }} onKeyDown={(e) => e.key === 'Enter' && !loading && startLearning()} placeholder="YouTube 링크를 붙여넣으세요" aria-label="유튜브 링크" aria-invalid={Boolean(loadError)} /><button onClick={() => void startLearning()} disabled={loading}>{loading ? <><span className="spinner" />분석 중</> : '학습 시작 →'}</button></div>
+          <div className="library-actions"><button className="text-button" onClick={() => { const id = extractYouTubeVideoId(url); if(id) playVideo({video_id: id}); else setLoadError('올바른 YouTube 링크를 입력해 주세요.') }}>영상만 재생 · 무료</button></div>
+          <UsageNotice usage={usage} />
           {loadError && <p className="url-error" role="alert">{loadError}</p>}
         </section>
 
         {loaded && <section className="workspace">
-          {tab === 'dictation' && <Dictation episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} initialPositionSec={learningProgressByVideo[episodeId]?.last_position_sec || 0} onProgress={(position, duration) => persistLearningProgress(episodeId, episodeTitle, sourceName, duration, position)} />}
+          {tab === 'dictation' && <Dictation artifactId={lesson?.artifact_id || ''} serverTranslations={lesson?.translations || []} onTranslation={prioritizeTranslation} onVisibleSentence={(index) => { nearSentence.current = index }} episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} initialPositionSec={learningProgressByVideo[episodeId]?.last_position_sec || 0} onProgress={(position, duration) => persistLearningProgress(episodeId, episodeTitle, sourceName, duration, position)} />}
           {tab === 'quiz' && <Quiz item={dictationItems[quizIndex]} index={quizIndex} total={dictationItems.length} answer={answer} setAnswer={setAnswer} state={quizState} submit={submitQuiz} next={() => { setAnswer(''); setQuizState('idle'); setQuizIndex((quizIndex + 1) % Math.max(1, dictationItems.length)) }} />}
           {tab === 'bag' && <Bag words={bag} items={learningItems} details={savedWordDetails} practice={() => navigateTo('quiz')} />}
           {tab === 'vault' && <Vault sentences={saved} remove={removeSavedSentence} />}
           {tab === 'journey' && <Journey progress={progress} />}
+          {tab === 'library' && <Library user={authUser} isAdmin={usage?.is_admin || false} onLogin={() => navigateTo('my')} onPlay={playVideo} onLearn={(value) => void startLearning(value)} onPrepared={acceptPrepared} />}
           {tab === 'my' && <MyPage user={authUser} loading={authLoading} configured={isSupabaseConfigured} onMessage={flash} />}
+          {tab === 'my' && authUser && <BillingPanel key={authUser.id} onChanged={refreshUsage} />}
         </section>}
       </main>
       <footer><small>© 2026 Turtle English</small></footer>
@@ -901,7 +896,7 @@ function MyPage({ user, loading, configured, onMessage }: { user: User | null; l
     </div> : <div className="my-login-state">
       <div className="my-login-mark" aria-hidden="true"><MenuIcon id="my" /></div>
       <h3>필요할 때만 로그인하세요</h3>
-      <p>로그인하지 않아도 받아쓰기와 모든 학습 기능을 계속 사용할 수 있어요.</p>
+      <p>영상과 추천 목록은 누구나 볼 수 있어요. AI 학습과 개인 저장은 로그인 후 이용해 주세요.</p>
       <button className="google-login" type="button" onClick={continueWithGoogle} disabled={action === 'login' || !configured}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M21.6 12.23c0-.71-.06-1.4-.18-2.07H12v3.91h5.38a4.6 4.6 0 0 1-2 3.02v2.54h3.24c1.9-1.75 2.98-4.33 2.98-7.4Z"/><path fill="#34A853" d="M12 22c2.7 0 4.97-.9 6.62-2.42l-3.24-2.54c-.9.6-2.05.96-3.38.96-2.6 0-4.81-1.76-5.6-4.13H3.06v2.62A10 10 0 0 0 12 22Z"/><path fill="#FBBC05" d="M6.4 13.87A6.02 6.02 0 0 1 6.09 12c0-.65.11-1.28.31-1.87V7.51H3.06A10 10 0 0 0 2 12c0 1.61.39 3.14 1.06 4.49l3.34-2.62Z"/><path fill="#EA4335" d="M12 6c1.47 0 2.79.5 3.83 1.5l2.87-2.87A9.63 9.63 0 0 0 12 2a10 10 0 0 0-8.94 5.51l3.34 2.62C7.19 7.76 9.4 6 12 6Z"/></svg>
         {action === 'login' ? 'Google로 이동 중…' : 'Google로 계속하기'}
@@ -1076,6 +1071,10 @@ function InteractiveScriptText({ text, sentenceIndex, items, highlights, complet
 }
 
 type DictationProps = {
+  artifactId: string
+  serverTranslations: TranslationItem[]
+  onTranslation: (index: number) => Promise<void>
+  onVisibleSentence: (index: number) => void
   episodeId: string
   title: string
   sourceName: string
@@ -1099,7 +1098,7 @@ type DictationProps = {
   onProgress: (position: number, duration: number) => void
 }
 
-function Dictation({ episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress, initialPositionSec, onProgress }: DictationProps) {
+function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSentence, episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress, initialPositionSec, onProgress }: DictationProps) {
   const [palette, setPalette] = useState<null | { line: number; start: number; end: number; text: string; x: number; y: number; placement: 'above' | 'below' }>(null)
   const [autoFollow, setAutoFollow] = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
@@ -1164,118 +1163,17 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }, [items])
 
   useEffect(() => {
-    let active = true
-    setTranslationHash('')
-    setTranslations({})
-    translationCache.current = {}
-    setExpandedTranslations(new Set())
-    setTranslationProgress({ completed: 0, total: transcript.length, persistent: false })
-    if (!episodeId || !transcript.length) return () => { active = false }
-    void transcriptDigest(transcript).then((hash) => {
-      if (!active) return
-      setTranslationHash(hash)
-    })
-    return () => { active = false }
-  }, [episodeId, transcript])
+    setTranslationHash(artifactId); setTranslations({}); translationCache.current = {}
+    setExpandedTranslations(new Set()); setTranslationLoading(new Set())
+    setWordPopover(null); setPalette(null)
+  }, [artifactId])
 
   useEffect(() => {
-    if (!translationHash || !transcript.length) return
-    const controller = new AbortController()
-    translationControllerRef.current?.abort()
-    translationControllerRef.current = controller
-    const localKey = `turtle-translations-${episodeId}-${translationHash}-${TRANSLATION_VERSION}`
-    try {
-      const stored = JSON.parse(localStorage.getItem(localKey) || '{}') as Record<number, string>
-      translationCache.current = stored
-      setTranslations(stored)
-    } catch {
-      translationCache.current = {}
-    }
-
-    const prepare = async () => {
-      try {
-        const cacheResponse = await fetch(`${API_BASE_URL}/api/translations/cache`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ video_id: episodeId, transcript_hash: translationHash, translation_version: TRANSLATION_VERSION, total_sentences: transcript.length }),
-          signal: controller.signal,
-        })
-        const cacheData = await readApiJson<TranslationCacheResponse>(cacheResponse)
-        if (!cacheResponse.ok || !cacheData || !('translations' in cacheData)) throw new Error((cacheData && 'detail' in cacheData && cacheData.detail) || '번역 캐시를 불러오지 못했습니다.')
-        cacheData.translations.forEach((item) => { translationCache.current[item.sentence_index] = item.translation_kr })
-        setTranslations({ ...translationCache.current })
-        setTranslationProgress({ completed: Object.keys(translationCache.current).length, total: transcript.length, persistent: cacheData.persistent })
-        localStorage.setItem(localKey, JSON.stringify(translationCache.current))
-
-        const chunks: number[][] = []
-        for (let index = 0; index < transcript.length; index += 25) {
-          const indices = Array.from({ length: Math.min(25, transcript.length - index) }, (_, offset) => index + offset)
-            .filter((sentenceIndex) => !translationCache.current[sentenceIndex])
-          if (indices.length) chunks.push(indices)
-        }
-        const worker = async () => {
-          while (!controller.signal.aborted) {
-            chunks.sort((a, b) => Math.abs((a[0] || 0) - visibleLineIndexRef.current) - Math.abs((b[0] || 0) - visibleLineIndexRef.current))
-            const indices = chunks.shift()
-            if (!indices) return
-            await requestTranslationBatch(indices, '/api/translations/batch', controller.signal)
-            localStorage.setItem(localKey, JSON.stringify(translationCache.current))
-          }
-        }
-        await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => worker()))
-      } catch (error) {
-        if (!controller.signal.aborted) console.warn('Background translation paused:', error)
-      }
-    }
-    void prepare()
-    return () => controller.abort()
-  }, [episodeId, sourceName, title, transcript, translationHash])
-
-  useEffect(() => {
-    const controller = new AbortController()
-    const candidates: Array<{ word: string; context: string; sentence_hash: string }> = []
-    const scheduled = new Set<string>()
-    for (const block of transcript) {
-      const words = block.text.match(/[A-Za-z][A-Za-z'’-]*/g) || []
-      for (const word of words) {
-        const normalized = word.toLocaleLowerCase()
-        const context = block.text.slice(0, 700)
-        const cacheKey = contextualWordKey(word, context)
-        if (word.length < 4 || PREFETCH_STOP_WORDS.has(normalized) || scheduled.has(cacheKey) || definitionCache.current.has(cacheKey)) continue
-        scheduled.add(cacheKey)
-        candidates.push({ word, context, sentence_hash: fastTextHash(context) })
-        if (candidates.length >= 90) break
-      }
-      if (candidates.length >= 90) break
-    }
-
-    const prefetch = async () => {
-      for (let index = 0; index < candidates.length; index += 30) {
-        if (controller.signal.aborted) return
-        try {
-          const batch = candidates.slice(index, index + 30)
-          const response = await fetch(`${API_BASE_URL}/api/vocabulary/prefetch`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ items: batch }),
-            signal: controller.signal,
-          })
-          if (!response.ok) return
-          const data = await response.json() as { definitions?: WordDefinition[] }
-          data.definitions?.forEach((definition, definitionIndex) => {
-            const source = batch[definitionIndex]
-            if (source) definitionCache.current.set(contextualWordKey(source.word, source.context), definition)
-          })
-          storeWordDefinitions(definitionCache.current)
-          await new Promise((resolve) => window.setTimeout(resolve, 250))
-        } catch {
-          return
-        }
-      }
-    }
-    void prefetch()
-    return () => controller.abort()
-  }, [episodeId, transcript])
+    const values = Object.fromEntries(serverTranslations.map(item => [item.sentence_index, item.translation_kr]))
+    translationCache.current = values; setTranslations(values)
+    setTranslationProgress({ completed: serverTranslations.length, total: transcript.length, persistent: true })
+    setTranslationLoading(current => new Set([...current].filter(index => !values[index])))
+  }, [serverTranslations, artifactId, transcript.length])
 
   useEffect(() => {
     let disposed = false
@@ -1296,7 +1194,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
           onStateChange: (event: { data: number }) => {
             if (disposed) return
             setPlaying(event.data === 1)
-            if (event.data === 2 || event.data === 0) {
+            if (event.data === 1 || event.data === 2 || event.data === 0) {
               const position = player.getCurrentTime() || 0
               const total = player.getDuration() || durationSec || 0
               onProgressRef.current(position, total)
@@ -1359,49 +1257,6 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
     })
   }
 
-  async function withTranslationSlot<T>(task: () => Promise<T>) {
-    const slots = translationSlotsRef.current
-    if (slots.active >= 2) await new Promise<void>((resolve) => slots.waiters.push(resolve))
-    slots.active += 1
-    try {
-      return await task()
-    } finally {
-      slots.active -= 1
-      slots.waiters.shift()?.()
-    }
-  }
-
-  async function requestTranslationBatch(indices: number[], endpoint: '/api/translations/batch' | '/api/translations/lookup', signal?: AbortSignal) {
-    const uniqueIndices = [...new Set(indices)].filter((index) => transcript[index] && !translationCache.current[index])
-    if (!uniqueIndices.length) return
-    const sentences = uniqueIndices.map((index) => ({
-      sentence_index: index,
-      text: transcript[index].text,
-      previous_text: transcript[index - 1]?.text || '',
-      next_text: transcript[index + 1]?.text || '',
-    }))
-    const response = await withTranslationSlot(() => fetch(`${API_BASE_URL}${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_id: episodeId,
-        transcript_hash: translationHash,
-        translation_version: TRANSLATION_VERSION,
-        total_sentences: transcript.length,
-        title,
-        channel_name: sourceName,
-        topic: title,
-        sentences,
-      }),
-      signal,
-    }))
-    const data = await readApiJson<TranslationCacheResponse>(response)
-    if (!response.ok || !data || !('translations' in data)) throw new Error((data && 'detail' in data && data.detail) || '번역을 불러오지 못했습니다.')
-    data.translations.forEach((item) => { translationCache.current[item.sentence_index] = item.translation_kr })
-    setTranslations({ ...translationCache.current })
-    setTranslationProgress({ completed: Object.keys(translationCache.current).length, total: transcript.length, persistent: data.persistent })
-  }
-
   function handleReadingScroll() {
     const container = readingBodyRef.current
     if (!container) return
@@ -1418,6 +1273,7 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
     })
     visibleLineIndexRef.current = closest
     setVisibleLineIndex(closest)
+    onVisibleSentence(closest)
   }
 
   function handlePointerDown(event: PointerEvent<HTMLParagraphElement>) {
@@ -1514,29 +1370,18 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
   }
 
   async function toggleLineTranslation(lineIndex: number) {
-    const block = transcript[lineIndex]
-    window.getSelection()?.removeAllRanges()
-    setPalette(null)
-    if (!block) return
+    window.getSelection()?.removeAllRanges(); setPalette(null)
     if (expandedTranslations.has(lineIndex)) {
-      setExpandedTranslations((current) => { const next = new Set(current); next.delete(lineIndex); return next })
+      setExpandedTranslations(current => { const next = new Set(current); next.delete(lineIndex); return next })
       return
     }
-    const cached = translationCache.current[lineIndex]
-    if (cached) {
-      setExpandedTranslations((current) => new Set(current).add(lineIndex))
-      return
-    }
-    setTranslationLoading((current) => new Set(current).add(lineIndex))
-    try {
-      await requestTranslationBatch([lineIndex], '/api/translations/lookup')
-      setExpandedTranslations((current) => new Set(current).add(lineIndex))
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '번역을 불러오지 못했습니다.'
-      setTranslations((current) => ({ ...current, [lineIndex]: message }))
-      setExpandedTranslations((current) => new Set(current).add(lineIndex))
-    } finally {
-      setTranslationLoading((current) => { const next = new Set(current); next.delete(lineIndex); return next })
+    setExpandedTranslations(current => new Set(current).add(lineIndex))
+    if (translationCache.current[lineIndex]) return
+    setTranslationLoading(current => new Set(current).add(lineIndex))
+    try { await onTranslation(lineIndex) }
+    catch (error) {
+      setTranslations(current => ({...current, [lineIndex]: error instanceof Error ? error.message : '번역을 불러오지 못했습니다.'}))
+      setTranslationLoading(current => { const next=new Set(current); next.delete(lineIndex); return next })
     }
   }
 
@@ -1584,13 +1429,9 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
     const fallback: WordDefinition = { word: lookupWord, word_type: 'word', definition_kr: '문맥에 맞는 뜻을 불러오는 중이에요.' }
     setWordPopover({ wordKey: cacheKey, x, y, loading: true, saved: alreadySaved, data: fallback })
     try {
-      const response = await fetch(`${API_BASE_URL}/api/vocabulary/lookup`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word, context, clicked_offset: charOffset, sentence_hash: fastTextHash(context) }),
+      const data = await platformJson<WordDefinition>('/api/learning/lookup', {
+        method: 'POST', body: JSON.stringify({ artifact_id: artifactId, word, sentence_index: sentenceIndex, clicked_offset: charOffset })
       })
-      const data = await response.json().catch(() => null) as WordDefinition | { detail?: string } | null
-      if (!response.ok || !data || !('word' in data)) throw new Error(data && 'detail' in data ? data.detail : '뜻을 불러오지 못했습니다.')
       definitionCache.current.set(cacheKey, data)
       storeWordDefinitions(definitionCache.current)
       setWordPopover((current) => current?.wordKey === cacheKey ? { ...current, loading: false, data } : current)
@@ -1624,9 +1465,9 @@ function Dictation({ episodeId, title, sourceName, durationSec, transcript, item
         <div><span>FULL TRANSCRIPT</span><h2>전체 스크립트</h2></div>
         <label className="follow-toggle"><span>자동으로 따라가기</span><input type="checkbox" checked={autoFollow} onChange={(event) => setAutoFollow(event.target.checked)} /><i aria-hidden="true" /><b>{autoFollow ? 'ON' : 'OFF'}</b></label>
       </div>
-      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{transcript.length ? (playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요') : '이 영상에는 동기화할 영어 자막이 없어요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 표현 {analysisProgress.completed}/{analysisProgress.total}</em>}{translationProgress.total > 0 && translationProgress.completed < translationProgress.total && <em>한국어 자막 {translationProgress.completed}/{translationProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{Math.max(0, currentIndex + 1)} / {transcript.length}</b></div>
+      <div className="now-listening"><span className={`wave ${playing ? 'active' : ''}`}>▮▰▮▰</span><span>{transcript.length ? (playing ? '현재 발화를 따라가고 있어요' : '재생하면 현재 문장을 표시해요') : '영상 재생은 무료입니다. AI 학습은 위에서 시작해 주세요'}</span>{['pending', 'running'].includes(analysisStatus) && <em>학습 표현 {analysisProgress.completed}/{analysisProgress.total}</em>}{translationProgress.total > 0 && translationProgress.completed < translationProgress.total && <em>한국어 자막 {translationProgress.completed}/{translationProgress.total}</em>}{analysisStatus === 'waiting_for_key' && <em>AI 분석 서버를 준비하고 있어요</em>}<b>{Math.max(0, currentIndex + 1)} / {transcript.length}</b></div>
       <div ref={readingBodyRef} className="transcript-body reading-body" onScroll={handleReadingScroll}>
-        {!transcript.length && <div className="empty-state">YouTube에서 사용할 수 있는 영어 자막을 제공하지 않아 전체 스크립트를 만들 수 없습니다.<br /><small>영상은 위 플레이어에서 그대로 재생할 수 있어요.</small></div>}
+        {!transcript.length && <div className="empty-state">AI 학습을 시작하면 전체 스크립트와 받아쓰기가 여기에 표시됩니다.<br /><small>영상은 위 플레이어에서 그대로 재생할 수 있어요.</small></div>}
         {transcript.map((line, index) => {
           const sentenceSaved = savedSentences.some((sentence) => savedSentenceKey(sentence.videoId, sentence) === savedSentenceKey(episodeId, { time: line.timestamp_display, text: line.text, timestampSec: line.timestamp_sec }))
           return <div ref={(element) => { lineRefs.current[index] = element }} key={`${line.timestamp_sec}-${index}`} className={`script-line reading-line ${index === currentIndex ? 'current' : ''}`} onClick={(event) => playFromTranscript(event, line.timestamp_sec)}>

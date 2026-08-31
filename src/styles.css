@@ -1543,3 +1543,24 @@ footer {
   .my-profile-fallback { width: 58px; height: 58px; }
   .my-logout { grid-column: 1 / -1; width: 100%; }
 }
+.library-tabs, .library-actions { display:flex; flex-wrap:wrap; gap:10px; margin:16px 0; }
+.library-panel h2 { margin:12px 0 24px; }
+.library-panel button, .subscription-panel button, .text-button { border:1px solid #dce4df; border-radius:10px; background:#f5f8f6; color:#28513e; padding:10px 16px; font:inherit; cursor:pointer; }
+.library-tabs button[aria-pressed="true"], .library-actions button:last-child:not(.text-button) { background:#224e3c; color:white; }
+.library-panel button:disabled, .subscription-panel button:disabled { opacity:.5; cursor:not-allowed; }
+.library-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr)); gap:24px; }
+.library-video { min-width:0; border:1px solid #e4e9e6; border-radius:16px; padding:20px; }
+.library-video > img { width:100%; aspect-ratio:16/9; object-fit:cover; border-radius:10px; margin-bottom:16px; }
+.library-video h3 { margin:10px 0; font-size:20px; overflow-wrap:anywhere; }
+.library-video p { line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
+.library-video small, .usage-notice { color:#6c7e74; line-height:1.65; }
+.usage-notice small { display:block; }
+.library-editor { display:grid; gap:12px; padding:16px 0; border-top:1px solid #e4e9e6; margin-top:20px; }
+.library-editor label { display:grid; gap:8px; font-size:14px; }
+.library-editor input, .library-editor textarea { width:100%; min-width:0; padding:12px; border:1px solid #dce4df; border-radius:8px; font:inherit; color:inherit; background:transparent; box-sizing:border-box; }
+.library-editor textarea { min-height:80px; resize:vertical; }
+.library-actions button, .library-panel .quiet-button { font-size:14px; }
+.subscription-panel { margin-top:24px; padding:28px; border:1px solid #e4e9e6; border-radius:20px; }
+.test-badge { color:#8a651f; background:#faf5e8; border-radius:8px; padding:12px; }
+.billing-history { list-style:none; padding:0; line-height:2; font-size:14px; color:#6c7e74; }
+@media(max-width:640px) { .library-grid { grid-template-columns:minmax(0,1fr); } .subscription-panel { padding:20px; } }

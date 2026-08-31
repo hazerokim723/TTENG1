@@ -8,3 +8,4 @@ backend/.venv/
 backend/.cache/
 __pycache__/
 *.py[cod]
+supabase/.temp/

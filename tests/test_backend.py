@@ -94,64 +94,13 @@ class TurtleEnglishApiTests(unittest.TestCase):
         self.assertEqual(rendered_sentences_from_chunk(chunk)[4], "This is the exact on-screen sentence.")
         self.assertEqual(mask_expression_in_sentence("come up with", 0, 12), "co__ up wi__")
 
-    def test_translation_cache_works_without_browser_supabase_credentials(self) -> None:
-        with patch.dict(os.environ, {"SUPABASE_URL": "", "SUPABASE_SERVICE_ROLE_KEY": ""}):
-            response = self.client.post(
-                "/api/translations/cache",
-                json={
-                    "video_id": "ELI8AwyXF1Q",
-                    "transcript_hash": "hash12345678",
-                    "translation_version": "test-v1",
-                    "total_sentences": 2,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["translations"], [])
-        self.assertFalse(response.json()["persistent"])
-
-    def test_batch_translation_is_cached_and_reused(self) -> None:
-        translated = [TranslationItem(sentence_index=0, translation_kr="자연스러운 번역입니다.")]
-        payload = {
-            "video_id": "ELI8AwyXF1Q",
-            "transcript_hash": "hash12345678",
-            "translation_version": "test-v1",
-            "total_sentences": 1,
-            "title": "Test episode",
-            "channel_name": "Test channel",
-            "topic": "Test topic",
-            "sentences": [{"sentence_index": 0, "text": "A natural translation."}],
-        }
-        env = {
-            "OPENAI_API_KEY": "test-key",
-            "SUPABASE_URL": "",
-            "SUPABASE_SERVICE_ROLE_KEY": "",
-        }
-        with patch.dict(os.environ, env), patch("backend.main.translate_sentences", return_value=translated) as translate:
-            first = self.client.post("/api/translations/batch", json=payload)
-            second = self.client.post("/api/translations/batch", json=payload)
-
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
-        self.assertEqual(first.json()["translations"][0]["translation_kr"], "자연스러운 번역입니다.")
-        translate.assert_called_once()
-
-    def test_lookup_accepts_only_one_sentence(self) -> None:
-        response = self.client.post(
-            "/api/translations/lookup",
-            json={
-                "video_id": "ELI8AwyXF1Q",
-                "transcript_hash": "hash12345678",
-                "translation_version": "test-v1",
-                "total_sentences": 2,
-                "sentences": [
-                    {"sentence_index": 0, "text": "First."},
-                    {"sentence_index": 1, "text": "Second."},
-                ],
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
+    def test_retired_endpoints_cannot_bypass_learning_allowance(self) -> None:
+        for endpoint in ["/api/translations/cache", "/api/translations/batch",
+                         "/api/translations/lookup", "/api/vocabulary/lookup",
+                         "/api/vocabulary/prefetch", "/api/episodes/analyze",
+                         "/api/episodes/analyze-chunk", "/api/openai/validate"]:
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.client.post(endpoint, json={}).status_code, 410)
 
     def test_supadata_uses_server_key_and_native_caption_mode(self) -> None:
         response_payload = {

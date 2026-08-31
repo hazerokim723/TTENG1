@@ -234,7 +234,7 @@ class TranslationCacheRequest(BaseModel):
     video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
     transcript_hash: str = Field(min_length=8, max_length=128)
     translation_version: str = Field(default=TRANSLATION_VERSION, max_length=80)
-    total_sentences: int = Field(ge=0, le=20_000)
+    total_sentences: int = Field(ge=0)
 
 
 class TranslationBatchRequest(TranslationCacheRequest):
@@ -271,8 +271,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4173", "http://127.0.0.1:4173"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -626,7 +626,7 @@ def make_prompt(transcript_chunk: str, chunk_index: int, chunk_count: int) -> st
 def analyze_chunk(
     transcript_chunk: str, chunk_index: int, chunk_count: int, api_key: str
 ) -> list[LearningItem]:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=100, max_retries=0)
     response = client.responses.parse(
         model=OPENAI_ANALYSIS_MODEL,
         input=make_prompt(transcript_chunk, chunk_index, chunk_count),
@@ -705,7 +705,7 @@ def public_analysis_error(error: Exception) -> str:
 
 def validate_openai_connection(api_key: str) -> None:
     """Make a minimal model request so auth, model access, and quota are verified."""
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=100, max_retries=0)
     client.responses.create(
         model=OPENAI_MODEL,
         input="Reply exactly with OK.",
@@ -764,7 +764,7 @@ async def run_analysis_job(
 def define_word(
     word: str, context: str, clicked_offset: int, api_key: str
 ) -> WordDefinition:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=100, max_retries=0)
     response = client.responses.parse(
         model=OPENAI_LOOKUP_MODEL,
         input=(
@@ -786,7 +786,7 @@ def define_word(
 
 
 def translate_sentence(text: str, api_key: str) -> TranslationResponse:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=100, max_retries=0)
     response = client.responses.parse(
         model=OPENAI_TRANSLATION_MODEL,
         input=(
@@ -808,7 +808,7 @@ def translate_sentence(text: str, api_key: str) -> TranslationResponse:
 def define_words(
     items: Sequence[DefineWordRequest], api_key: str
 ) -> list[WordDefinition]:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=100, max_retries=0)
     input_items = [item.model_dump() for item in items]
     response = client.responses.parse(
         model=OPENAI_LOOKUP_MODEL,
@@ -962,7 +962,7 @@ def write_supabase_translations(
 def translate_sentences(
     payload: TranslationBatchRequest, api_key: str
 ) -> list[TranslationItem]:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=100, max_retries=0)
     input_rows = [sentence.model_dump() for sentence in payload.sentences]
     response = client.responses.parse(
         model=OPENAI_TRANSLATION_MODEL,
@@ -1534,3 +1534,9 @@ async def get_analysis_status(video_id: str, request: Request) -> AnalysisStatus
         total_chunks=job["total_chunks"],
         error=job.get("error"),
     )
+
+
+# Public learning operations are served through authenticated, durable platform APIs.
+import sys
+from backend.learning_platform import install as install_learning_platform
+install_learning_platform(app, sys.modules[__name__])
