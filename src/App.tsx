@@ -4,8 +4,8 @@ import { createDictationSlots, hiddenDictationAnswer, normalizeDictationInput } 
 import { isSelectionGesture } from './scriptInteractions'
 import { WordPopover } from './WordPopover'
 import { shortWordMeaning } from './shortWordMeaning'
-import type { User } from '@supabase/supabase-js'
-import { isSupabaseConfigured, supabase } from './supabase'
+import type { Session, User } from '@supabase/supabase-js'
+import { isSupabaseConfigured, supabase, supabasePublishableKey, supabaseUrl } from './supabase'
 import { Library, BillingPanel, LearningUsageDialog, platformJson, type LessonSnapshot, type Usage } from './library'
 
 type Tab = 'dictation' | 'quiz' | 'bag' | 'vault' | 'journey' | 'my' | 'library'
@@ -72,6 +72,11 @@ type LearningProgressRecord = {
   started_at: string
   last_studied_at: string
   completed_at: string | null
+}
+type ProgressSaveState = {
+  videoId: string
+  status: 'idle' | 'saving' | 'saved' | 'error'
+  savedAt?: string
 }
 type TranslationItem = { sentence_index: number; translation_kr: string }
 type TranslationCacheResponse = {
@@ -410,6 +415,9 @@ function App() {
   const workSlots = useRef(0)
   const analysisControllerRef = useRef<AbortController | null>(null)
   const previousAuthUserIdRef = useRef<string | null>(null)
+  const authSessionRef = useRef<Session | null>(null)
+  const progressSaveSequenceRef = useRef(0)
+  const [progressSaveState, setProgressSaveState] = useState<ProgressSaveState>({ videoId: '', status: 'idle' })
 
   function navigateTo(nextTab: Tab) {
     setTab(nextTab)
@@ -433,14 +441,23 @@ function App() {
     }
 
     let active = true
-    supabase.auth.getSession().then(({ data }) => {
+    void (async () => {
+      const { data } = await supabase.auth.getSession()
+      let session = data.session
+      const expiresSoon = session?.expires_at && session.expires_at * 1000 <= Date.now() + 60_000
+      if (expiresSoon) {
+        const refreshed = await supabase.auth.refreshSession()
+        if (refreshed.data.session) session = refreshed.data.session
+      }
       if (!active) return
-      setAuthUser(data.session?.user ?? null)
+      authSessionRef.current = session
+      setAuthUser(session?.user ?? null)
       setAuthLoading(false)
-    })
+    })()
 
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!active) return
+      authSessionRef.current = session
       setAuthUser(session?.user ?? null)
       setAuthLoading(false)
     })
@@ -453,50 +470,79 @@ function App() {
 
   useEffect(() => {
     if (!supabase || !authUser) return
+    const client = supabase
     let active = true
 
-    void Promise.all([
-      supabase.from('saved_words').select('word, word_key, word_type, definition_kr').eq('user_id', authUser.id).order('created_at', { ascending: true }),
-      supabase.from('saved_sentences').select('id, sentence_key, sentence_text, video_id, video_title, channel_name, timestamp_sec, timestamp_display, created_at').eq('user_id', authUser.id).order('created_at', { ascending: false }),
-      supabase.from('learning_progress').select('video_id, video_title, channel_name, duration_sec, last_position_sec, progress_percent, status, started_at, last_studied_at, completed_at').eq('user_id', authUser.id).order('last_studied_at', { ascending: false }),
-    ]).then(([wordsResult, sentencesResult, progressResult]) => {
+    const fetchWords = () => client.from('saved_words').select('word, word_key, word_type, definition_kr').eq('user_id', authUser.id).order('created_at', { ascending: true })
+    const fetchSentences = () => client.from('saved_sentences').select('id, sentence_key, sentence_text, video_id, video_title, channel_name, timestamp_sec, timestamp_display, created_at').eq('user_id', authUser.id).order('created_at', { ascending: false })
+    const fetchProgress = () => client.from('learning_progress').select('video_id, video_title, channel_name, duration_sec, last_position_sec, progress_percent, status, started_at, last_studied_at, completed_at').eq('user_id', authUser.id).order('last_studied_at', { ascending: false })
+
+    void (async () => {
+      const sessionResult = await client.auth.getSession()
+      let session = sessionResult.data.session
+      const expiresSoon = session?.expires_at && session.expires_at * 1000 <= Date.now() + 60_000
+      if (expiresSoon) {
+        const refreshed = await client.auth.refreshSession()
+        if (refreshed.data.session) session = refreshed.data.session
+      }
+      if (!active || !session || session.user.id !== authUser.id) return
+      authSessionRef.current = session
+
+      let [wordsResult, sentencesResult, progressResult] = await Promise.all([fetchWords(), fetchSentences(), fetchProgress()])
+      if ([wordsResult.status, sentencesResult.status, progressResult.status].includes(401)) {
+        const refreshed = await client.auth.refreshSession()
+        if (refreshed.data.session) authSessionRef.current = refreshed.data.session
+        if (!refreshed.error && active) {
+          if (wordsResult.status === 401) wordsResult = await fetchWords()
+          if (sentencesResult.status === 401) sentencesResult = await fetchSentences()
+          if (progressResult.status === 401) progressResult = await fetchProgress()
+        }
+      }
       if (!active) return
-      if (wordsResult.error || sentencesResult.error || progressResult.error) {
-        flash('계정 저장 내용을 불러오지 못했어요. 잠시 후 다시 시도해 주세요')
-        return
+
+      if (!wordsResult.error) {
+        const remoteWords = wordsResult.data || []
+        setBag(Array.from(new Set(remoteWords.map((row) => row.word_key))))
+        setSavedWordDetails(() => {
+          const next: SavedWordDetails = {}
+          remoteWords.forEach((row) => {
+            next[row.word_key] = {
+              word: row.word,
+              word_type: row.word_type || 'word',
+              definition_kr: row.definition_kr || '저장된 단어',
+            }
+          })
+          return next
+        })
       }
 
-      const remoteWords = wordsResult.data || []
-      setBag(Array.from(new Set(remoteWords.map((row) => row.word_key))))
-      setSavedWordDetails(() => {
-        const next: SavedWordDetails = {}
-        remoteWords.forEach((row) => {
-          next[row.word_key] = {
-            word: row.word,
-            word_type: row.word_type || 'word',
-            definition_kr: row.definition_kr || '저장된 단어',
-          }
-        })
-        return next
-      })
+      if (!sentencesResult.error) {
+        const remoteSentences: SavedSentence[] = (sentencesResult.data || []).map((row) => ({
+          id: `remote-${row.id}`,
+          remoteId: row.id,
+          time: row.timestamp_display || formatPlayerTime(row.timestamp_sec || 0),
+          text: row.sentence_text,
+          savedAt: row.created_at,
+          videoId: row.video_id || undefined,
+          videoTitle: row.video_title || undefined,
+          channelName: row.channel_name || undefined,
+          timestampSec: row.timestamp_sec || 0,
+        }))
+        setSaved(remoteSentences)
+      }
 
-      const remoteSentences: SavedSentence[] = (sentencesResult.data || []).map((row) => ({
-        id: `remote-${row.id}`,
-        remoteId: row.id,
-        time: row.timestamp_display || formatPlayerTime(row.timestamp_sec || 0),
-        text: row.sentence_text,
-        savedAt: row.created_at,
-        videoId: row.video_id || undefined,
-        videoTitle: row.video_title || undefined,
-        channelName: row.channel_name || undefined,
-        timestampSec: row.timestamp_sec || 0,
-      }))
-      setSaved(remoteSentences)
-      setLearningProgressByVideo(Object.fromEntries((progressResult.data || []).map((row) => [row.video_id, row as LearningProgressRecord])))
+      if (!progressResult.error) {
+        setLearningProgressByVideo(Object.fromEntries((progressResult.data || []).map((row) => [row.video_id, row as LearningProgressRecord])))
+      }
+      if (wordsResult.error || sentencesResult.error || progressResult.error) {
+        flash('일부 계정 저장 내용을 불러오지 못했어요. 잠시 후 다시 시도해 주세요')
+      }
+    })().catch(() => {
+      if (active) flash('계정 저장 내용을 불러오지 못했어요. 잠시 후 다시 시도해 주세요')
     })
 
     return () => { active = false }
-  }, [authUser])
+  }, [authUser?.id])
 
   useEffect(() => {
     if (authLoading) return
@@ -534,7 +580,7 @@ function App() {
     Math.round(learningProgressByVideo[episodeId]?.progress_percent || 0)))
   const dictationItems = useMemo(() => learningItems.filter((item) => item.is_dictation_target !== false), [learningItems])
 
-  function persistLearningProgress(videoId: string, title: string, channel: string, duration: number, position = 0) {
+  function persistLearningProgress(videoId: string, title: string, channel: string, duration: number, position = 0, keepalive = false) {
     if (!supabase || !authUser || !videoId) return
     const safeDuration = Math.max(0, duration || 0)
     const safePosition = Math.max(0, Math.min(position || 0, safeDuration || position || 0))
@@ -555,12 +601,48 @@ function App() {
       completed_at: status === 'completed' ? (existing?.completed_at || now) : null,
     }
     setLearningProgressByVideo((current) => ({ ...current, [videoId]: record }))
-    void supabase.from('learning_progress').upsert({
+    const payload = {
       user_id: authUser.id,
       ...record,
-    }, { onConflict: 'user_id,video_id' }).then(({ error }) => {
-      if (error) flash('학습 기록을 계정에 저장하지 못했어요')
-    })
+    }
+    const sequence = ++progressSaveSequenceRef.current
+    setProgressSaveState({ videoId, status: 'saving' })
+
+    if (keepalive && authSessionRef.current?.access_token && supabaseUrl && supabasePublishableKey) {
+      void fetch(`${supabaseUrl}/rest/v1/learning_progress?on_conflict=user_id%2Cvideo_id`, {
+        method: 'POST',
+        keepalive: true,
+        headers: {
+          apikey: supabasePublishableKey,
+          Authorization: `Bearer ${authSessionRef.current.access_token}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates',
+        },
+        body: JSON.stringify(payload),
+      }).then((response) => {
+        if (sequence !== progressSaveSequenceRef.current) return
+        setProgressSaveState({ videoId, status: response.ok ? 'saved' : 'error', savedAt: response.ok ? new Date().toISOString() : undefined })
+      }).catch(() => {
+        if (sequence === progressSaveSequenceRef.current) setProgressSaveState({ videoId, status: 'error' })
+      })
+      return
+    }
+
+    void (async () => {
+      let result = await supabase.from('learning_progress').upsert(payload, { onConflict: 'user_id,video_id' })
+      if (result.status === 401) {
+        const refreshed = await supabase.auth.refreshSession()
+        if (refreshed.data.session) authSessionRef.current = refreshed.data.session
+        if (!refreshed.error) result = await supabase.from('learning_progress').upsert(payload, { onConflict: 'user_id,video_id' })
+      }
+      if (sequence !== progressSaveSequenceRef.current) return
+      if (result.error) {
+        setProgressSaveState({ videoId, status: 'error' })
+        flash('학습 기록을 계정에 저장하지 못했어요')
+      } else {
+        setProgressSaveState({ videoId, status: 'saved', savedAt: new Date().toISOString() })
+      }
+    })()
   }
 
   async function refreshUsage() {
@@ -832,7 +914,7 @@ function App() {
         </section>
 
         {loaded && <section className="workspace">
-          {tab === 'dictation' && <Dictation artifactId={lesson?.artifact_id || ''} serverTranslations={lesson?.translations || []} onTranslation={prioritizeTranslation} onVisibleSentence={(index) => { nearSentence.current = index }} episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} analysisStatus={analysisStatus} analysisProgress={analysisProgress} initialPositionSec={learningProgressByVideo[episodeId]?.last_position_sec || 0} onProgress={(position, duration) => persistLearningProgress(episodeId, episodeTitle, sourceName, duration, position)} />}
+          {tab === 'dictation' && <Dictation artifactId={lesson?.artifact_id || ''} serverTranslations={lesson?.translations || []} onTranslation={prioritizeTranslation} onVisibleSentence={(index) => { nearSentence.current = index }} episodeId={episodeId} title={episodeTitle} sourceName={sourceName} durationSec={durationSec} transcript={transcript} items={learningItems} playing={playing} setPlaying={setPlaying} highlights={highlights} toggleHighlight={toggleHighlight} savedSentences={saved} saveSentence={saveSentence} savedWords={bag} saveWord={saveWord} completedWords={completedWords} completeWord={completeWord} episodeProgress={episodeProgress} progressSaveState={progressSaveState.videoId === episodeId ? progressSaveState : { videoId: episodeId, status: 'idle' }} analysisStatus={analysisStatus} analysisProgress={analysisProgress} initialPositionSec={learningProgressByVideo[episodeId]?.last_position_sec || 0} onProgress={(position, duration, keepalive) => persistLearningProgress(episodeId, episodeTitle, sourceName, duration, position, keepalive)} />}
           {tab === 'quiz' && <Quiz item={dictationItems[quizIndex]} index={quizIndex} total={dictationItems.length} answer={answer} setAnswer={setAnswer} state={quizState} submit={submitQuiz} next={() => { setAnswer(''); setQuizState('idle'); setQuizIndex((quizIndex + 1) % Math.max(1, dictationItems.length)) }} />}
           {tab === 'bag' && <Bag words={bag} items={learningItems} details={savedWordDetails} practice={() => navigateTo('quiz')} />}
           {tab === 'vault' && <Vault sentences={saved} remove={removeSavedSentence} />}
@@ -1100,13 +1182,14 @@ type DictationProps = {
   completedWords: string[]
   completeWord: (word: string) => void
   episodeProgress: number
+  progressSaveState: ProgressSaveState
   analysisStatus: AnalysisStatus
   analysisProgress: { completed: number; total: number }
   initialPositionSec: number
-  onProgress: (position: number, duration: number) => void
+  onProgress: (position: number, duration: number, keepalive?: boolean) => void
 }
 
-function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSentence, episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, analysisStatus, analysisProgress, initialPositionSec, onProgress }: DictationProps) {
+function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSentence, episodeId, title, sourceName, durationSec, transcript, items, playing, setPlaying, highlights, toggleHighlight, savedSentences, saveSentence, savedWords, saveWord, completedWords, completeWord, episodeProgress, progressSaveState, analysisStatus, analysisProgress, initialPositionSec, onProgress }: DictationProps) {
   const [palette, setPalette] = useState<null | { line: number; start: number; end: number; text: string; x: number; y: number; placement: 'above' | 'below' }>(null)
   const [autoFollow, setAutoFollow] = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
@@ -1150,6 +1233,23 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
   }, [currentTime, transcript])
 
   useEffect(() => { onProgressRef.current = onProgress }, [onProgress])
+
+  useEffect(() => {
+    const saveBeforeBackground = () => {
+      const player = playerRef.current
+      if (!player || !episodeId) return
+      onProgressRef.current(player.getCurrentTime() || 0, player.getDuration() || durationSec || 0, true)
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') saveBeforeBackground()
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('pagehide', saveBeforeBackground)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('pagehide', saveBeforeBackground)
+    }
+  }, [durationSec, episodeId])
 
   useEffect(() => {
     let changed = false
@@ -1520,7 +1620,7 @@ function Dictation({ artifactId, serverTranslations, onTranslation, onVisibleSen
         <h2 id="episode-title">{title}</h2>
         <p>{sourceName}</p>
       </div>
-      <div className="completion episode-completion"><span><b>에피소드 진도</b><b>{episodeProgress}%</b></span><div><i style={{ width: `${episodeProgress}%` }} /></div></div>
+      <div className="completion episode-completion"><span><b>에피소드 진도</b><b>{episodeProgress}%</b></span><div><i style={{ width: `${episodeProgress}%` }} /></div>{progressSaveState.status !== 'idle' && <small className={`progress-save-status ${progressSaveState.status}`} role="status">{progressSaveState.status === 'saving' ? '저장 중…' : progressSaveState.status === 'error' ? '저장 재시도 필요' : `마지막 저장 ${new Date(progressSaveState.savedAt || Date.now()).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}`}</small>}</div>
       <div className="audio-player" aria-label="에피소드 오디오 플레이어">
         <button className="audio-play" onClick={togglePlayback} disabled={!playerReady} aria-label={playing ? '일시정지' : '재생'}>{playing ? 'Ⅱ' : '▶'}</button>
         <span>{formatPlayerTime(currentTime)}</span>
